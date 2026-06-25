@@ -1,0 +1,2917 @@
+import React, { useState, useMemo } from "react";
+import {
+  LineChart, Line, BarChart, Bar, ComposedChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
+  ReferenceLine, ResponsiveContainer,
+} from "recharts";
+import { Upload, RefreshCw, Info, CheckCircle2, Download } from "lucide-react";
+import Papa from "papaparse";
+
+/* ============================================================
+   TOKENS DE DISEÑO
+   ============================================================ */
+const COLORS = {
+  bg: "#F5F1E8",
+  panel: "#FFFFFF",
+  panelAlt: "#FBF8F1",
+  border: "#E1DAC4",
+  ink: "#23292E",
+  inkMuted: "#79705F",
+  accent: "#0E6B63",
+  accentSoft: "#E3EEEA",
+  amber: "#B5742A",
+  amberSoft: "#F5E9D7",
+  graphite: "#2E343A",
+  brick: "#96402B",
+  grid: "#E7E1CE",
+};
+
+/* ============================================================
+   UTILIDADES DE FECHA / FORMATO
+   ============================================================ */
+const MESES = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"];
+const monthLabel = (d) => `${MESES[d.m]} ${String(d.y).slice(2)}`;
+const addMonths = (d, k) => {
+  let mm = d.m + k, yy = d.y;
+  while (mm >= 12) { mm -= 12; yy += 1; }
+  return { y: yy, m: mm };
+};
+const mean = (arr) => arr.reduce((s, v) => s + v, 0) / arr.length;
+const fmt = (v, d = 0) =>
+  v == null || !isFinite(v) ? "—" : v.toLocaleString("es-CL", { maximumFractionDigits: d, minimumFractionDigits: d });
+const fmtPct = (v) => (v == null || !isFinite(v) ? "—" : `${(v * 100).toFixed(1)}%`);
+
+/* ============================================================
+   MÉTRICAS DE ERROR
+   ============================================================ */
+function calcErrors(actual, predicted) {
+  const n = actual.length;
+  let sumAbsErr = 0, sumSqErr = 0, sumErr = 0, sumAbsActual = 0;
+  for (let i = 0; i < n; i++) {
+    const err = actual[i] - predicted[i];
+    sumAbsErr += Math.abs(err);
+    sumSqErr += err * err;
+    sumErr += err;
+    sumAbsActual += Math.abs(actual[i]);
+  }
+  return {
+    mae: sumAbsErr / n,
+    rmse: Math.sqrt(sumSqErr / n),
+    bias: sumErr / n,
+    wmape: sumAbsActual > 0 ? sumAbsErr / sumAbsActual : null,
+  };
+}
+function sseFromFitted(y, fitted, startIdx) {
+  let s = 0;
+  for (let t = startIdx; t < y.length; t++) if (fitted[t] != null) s += Math.pow(y[t] - fitted[t], 2);
+  return s;
+}
+
+/* ============================================================
+   MODELOS DE FORECAST (implementación de bajo nivel)
+   ============================================================ */
+function sesFit(y, alpha) {
+  const n = y.length;
+  const level = new Array(n);
+  const fitted = new Array(n).fill(null);
+  level[0] = y[0];
+  for (let t = 1; t < n; t++) {
+    fitted[t] = level[t - 1];
+    level[t] = alpha * y[t] + (1 - alpha) * level[t - 1];
+  }
+  const last = level[n - 1];
+  return { fitted, forecast: (h) => Array.from({ length: h }, () => last) };
+}
+
+function holtFit(y, alpha, beta) {
+  const n = y.length;
+  if (n < 3) return null;
+  const level = new Array(n), trend = new Array(n);
+  const fitted = new Array(n).fill(null);
+  level[0] = y[0];
+  trend[0] = y[1] - y[0];
+  if (n > 1) fitted[1] = level[0] + trend[0];
+  for (let t = 1; t < n; t++) {
+    const pl = level[t - 1], pt = trend[t - 1];
+    const nl = alpha * y[t] + (1 - alpha) * (pl + pt);
+    const nt = beta * (nl - pl) + (1 - beta) * pt;
+    level[t] = nl; trend[t] = nt;
+    if (t + 1 < n) fitted[t + 1] = nl + nt;
+  }
+  const ll = level[n - 1], lt = trend[n - 1];
+  return { fitted, forecast: (h) => Array.from({ length: h }, (_, i) => ll + (i + 1) * lt) };
+}
+
+function hwFit(y, alpha, beta, gamma, m) {
+  const n = y.length;
+  if (n < 2 * m) return null;
+  const s1 = y.slice(0, m), s2 = y.slice(m, 2 * m);
+  const a1 = mean(s1), a2 = mean(s2);
+  let lvl = a1, tr = (a2 - a1) / m;
+  const seasonal = s1.map((v) => v - a1);
+  const fitted = new Array(n).fill(null);
+  for (let t = 0; t < n; t++) {
+    const sTm = t < m ? seasonal[t] : seasonal[t - m];
+    if (t >= 1) fitted[t] = lvl + tr + sTm;
+    const nl = alpha * (y[t] - sTm) + (1 - alpha) * (lvl + tr);
+    const nt = beta * (nl - lvl) + (1 - beta) * tr;
+    const ns = gamma * (y[t] - nl) + (1 - gamma) * sTm;
+    lvl = nl; tr = nt;
+    seasonal[t] = ns;
+  }
+  const lastSeasonals = seasonal.slice(n - m, n);
+  return {
+    fitted,
+    forecast: (h) => Array.from({ length: h }, (_, i) => lvl + (i + 1) * tr + lastSeasonals[i % m]),
+  };
+}
+
+function linearFit(y) {
+  const n = y.length;
+  const tArr = Array.from({ length: n }, (_, i) => i);
+  const tMean = mean(tArr), yMean = mean(y);
+  let num = 0, den = 0;
+  for (let i = 0; i < n; i++) { num += (tArr[i] - tMean) * (y[i] - yMean); den += (tArr[i] - tMean) ** 2; }
+  const b = den === 0 ? 0 : num / den;
+  const a = yMean - b * tMean;
+  const fitted = tArr.map((t) => a + b * t);
+  return { a, b, fitted, forecast: (h) => Array.from({ length: h }, (_, i) => a + b * (n + i)) };
+}
+
+function crostonFit(y, alpha) {
+  const nzIdx = [];
+  for (let t = 0; t < y.length; t++) if (y[t] > 0) nzIdx.push(t);
+  if (nzIdx.length < 2) return null;
+  let Z = y[nzIdx[0]];
+  let P = nzIdx[0] + 1;
+  for (let i = 1; i < nzIdx.length; i++) {
+    const interval = nzIdx[i] - nzIdx[i - 1];
+    Z = alpha * y[nzIdx[i]] + (1 - alpha) * Z;
+    P = alpha * interval + (1 - alpha) * P;
+  }
+  const val = (Z / P) * (1 - alpha / 2);
+  return { fitted: new Array(y.length).fill(null), forecast: (h) => Array.from({ length: h }, () => val) };
+}
+
+/* ============================================================
+   DETECCIÓN DE OUTLIERS (IQR + quiebres de stock)
+   ============================================================ */
+function detectOutliers(series) {
+  const n = series.length;
+  const nonZero = series.filter((v) => v > 0);
+  if (nonZero.length < 4) return [];
+  const sorted = [...nonZero].sort((a, b) => a - b);
+  const q1 = sorted[Math.floor(sorted.length * 0.25)];
+  const q3 = sorted[Math.floor(sorted.length * 0.75)];
+  const iqr = q3 - q1;
+  const upper = q3 + 2.0 * iqr;
+  const lower = Math.max(0, q1 - 2.0 * iqr);
+  const meanNZ = mean(nonZero);
+  const zeroStreak = 3; // ≥3 ceros seguidos = posible quiebre de stock
+
+  const flags = [];
+  let zeros = 0;
+  for (let i = 0; i < n; i++) {
+    const v = series[i];
+    if (v === 0) {
+      zeros++;
+      if (zeros === zeroStreak && meanNZ > 5) {
+        flags.push({ index: i - zeroStreak + 1, endIndex: i, type: "stockout", label: "Posible quiebre de stock" });
+      }
+    } else {
+      zeros = 0;
+      if (v > upper) flags.push({ index: i, type: "high", label: `Pico atípico (>${fmt(upper, 0)})` });
+      else if (v < lower && lower > 0) flags.push({ index: i, type: "low", label: `Valle atípico (<${fmt(lower, 0)})` });
+    }
+  }
+  return flags;
+}
+
+function applyClean(series, outliers) {
+  const clean = [...series];
+  for (const f of outliers) {
+    if (f.type === "stockout") {
+      for (let k = f.index; k <= (f.endIndex || f.index); k++) {
+        const prev = k > 0 ? clean[k - 1] : null;
+        const next = k < clean.length - 1 ? series[k + 1] : null;
+        if (prev != null && next != null) clean[k] = Math.round((prev + next) / 2);
+        else if (prev != null) clean[k] = prev;
+        else clean[k] = series[k];
+      }
+    } else {
+      const i = f.index;
+      const prev = i > 0 ? series[i - 1] : null;
+      const next = i < series.length - 1 ? series[i + 1] : null;
+      if (prev != null && next != null) clean[i] = Math.round((prev + next) / 2);
+      else if (prev != null) clean[i] = prev;
+      else clean[i] = Math.round(mean(series.filter((v) => v > 0)));
+    }
+  }
+  return clean;
+}
+
+/* ============================================================
+   CLASIFICACIÓN ABC-XYZ
+   ============================================================ */
+const ABC_XYZ_STRATEGIES = {
+  AX: { label: "AX", desc: "Mejor modelo estadístico. Foco máximo. Revisión mensual.", color: "#0E6B63" },
+  AY: { label: "AY", desc: "Estadístico + inteligencia de mercado. Validar con ventas.", color: "#1A8A7A" },
+  AZ: { label: "AZ", desc: "Forecast colaborativo. Alta incertidumbre, alto impacto.", color: "#B5742A" },
+  BX: { label: "BX", desc: "Modelo estadístico. Revisión trimestral.", color: "#2E343A" },
+  BY: { label: "BY", desc: "Estadístico simplificado + buffer de seguridad moderado.", color: "#4A5568" },
+  BZ: { label: "BZ", desc: "Min-Max. Revisar si vale la pena mantener el SKU.", color: "#79705F" },
+  CX: { label: "CX", desc: "Punto de reorden simple. Sin forecast complejo.", color: "#9AA5B1" },
+  CY: { label: "CY", desc: "Min-Max básico. Bajo esfuerzo de planificación.", color: "#A0AEC0" },
+  CZ: { label: "CZ", desc: "VMI / consignación. Evaluar discontinuación.", color: "#CBD5E0" },
+};
+
+/* ============================================================
+   INVENTARIO: STOCK DE SEGURIDAD + PUNTO DE REORDEN
+   ============================================================ */
+const Z_TABLE = { 80: 0.842, 85: 1.036, 90: 1.282, 95: 1.645, 98: 2.054, 99: 2.326, 99.5: 2.576 };
+const SL_BY_ABC = { A: 99, B: 95, C: 90 };
+
+function calcInventory(series, forecast12, lt, sl, reviewPeriod) {
+  const last12 = series.slice(Math.max(0, series.length - 12));
+  const nonZero = last12.filter((v) => v > 0);
+  const avgDemand = last12.length > 0 ? mean(last12) : 0;
+  const avgDemandNZ = nonZero.length > 0 ? mean(nonZero) : 0;
+  const variance = last12.length > 1
+    ? last12.reduce((acc, v) => acc + (v - avgDemand) ** 2, 0) / last12.length : 0;
+  const stdDev = Math.sqrt(variance);
+
+  const avgFc = forecast12 && forecast12.length > 0 ? mean(forecast12.slice(0, Math.min(3, forecast12.length))) : avgDemand;
+
+  const z = Z_TABLE[sl] || 1.645;
+  const ss = Math.max(0, Math.round(z * stdDev * Math.sqrt(lt)));
+  const rop = Math.round(avgDemand * lt + ss);
+  const maxStock = Math.round(avgDemand * (lt + reviewPeriod) + ss);
+  const minStock = ss;
+  const coverage = avgDemand > 0 ? (rop / avgDemand).toFixed(1) : "—";
+
+  return { avgDemand, avgDemandNZ, stdDev, ss, rop, maxStock, minStock, avgFc, coverage, z, sl };
+}
+
+function classifyABCXYZ(skuData) {
+  const skus = Object.keys(skuData);
+  const stats = skus.map((sku) => {
+    const s = skuData[sku].series;
+    const last = s.slice(Math.max(0, s.length - 12));
+    const total = last.reduce((a, b) => a + b, 0);
+    const nonZero = last.filter((v) => v > 0);
+    const m = nonZero.length > 0 ? mean(nonZero) : 0;
+    const variance = nonZero.length > 1
+      ? nonZero.reduce((acc, v) => acc + (v - m) ** 2, 0) / nonZero.length : 0;
+    const cv = m > 0 ? Math.sqrt(variance) / m : 999;
+    return { sku, total, cv };
+  });
+
+  const totalSum = stats.reduce((a, b) => a + b.total, 0);
+  const sorted = [...stats].sort((a, b) => b.total - a.total);
+  let cumPct = 0;
+  const abc = {};
+  for (const s of sorted) {
+    cumPct += totalSum > 0 ? s.total / totalSum : 1 / skus.length;
+    abc[s.sku] = cumPct <= 0.8 ? "A" : cumPct <= 0.95 ? "B" : "C";
+  }
+  const xyz = {};
+  for (const s of stats) xyz[s.sku] = s.cv < 0.5 ? "X" : s.cv < 1.0 ? "Y" : "Z";
+
+  return stats.reduce((acc, s) => {
+    acc[s.sku] = {
+      abc: abc[s.sku], xyz: xyz[s.sku],
+      cell: abc[s.sku] + xyz[s.sku],
+      cv: s.cv, total: s.total,
+      pct: totalSum > 0 ? s.total / totalSum : 0,
+    };
+    return acc;
+  }, {});
+}
+
+/* ============================================================
+   CICLO DE VIDA DEL SKU
+   Clasifica cada SKU según su patrón de demanda en el tiempo.
+   ============================================================ */
+const LIFECYCLE = {
+  nuevo:        { label: "Nuevo lanzamiento", color: "#1E5FA8", icon: "🌱", desc: "Historia corta. Forecast con cautela, considerar análogo." },
+  crecimiento:  { label: "Crecimiento",       color: "#0E6B63", icon: "📈", desc: "Tendencia al alza sostenida. Modelo con tendencia (Holt)." },
+  maduro:       { label: "Maduro",            color: "#2E343A", icon: "➡️", desc: "Demanda estable. Modelo estacional clásico." },
+  declive:      { label: "Declive",           color: "#B5742A", icon: "📉", desc: "Tendencia a la baja. Revisar surtido y stock." },
+  errático:     { label: "Errático/Intermitente", color: "#96402B", icon: "⚡", desc: "Alta variabilidad o intermitente. Croston / Min-Max." },
+  descontinuar: { label: "Candidato a discontinuar", color: "#9AA5B1", icon: "⛔", desc: "Sin demanda reciente. Evaluar baja del catálogo." },
+};
+
+function detectLifecycle(series, dates) {
+  const n = series.length;
+  const nonZero = series.filter((v) => v > 0);
+
+  // Sin movimiento reciente → descontinuar
+  const recent6 = series.slice(Math.max(0, n - 6));
+  if (recent6.every((v) => v === 0)) return { stage: "descontinuar", confidence: "alta" };
+
+  // Historia corta → nuevo lanzamiento
+  if (n < 12 || nonZero.length < 8) return { stage: "nuevo", confidence: n < 8 ? "alta" : "media" };
+
+  // Intermitencia: muchos ceros
+  const zeroRatio = series.filter((v) => v === 0).length / n;
+  if (zeroRatio > 0.35) return { stage: "errático", confidence: "alta" };
+
+  // CV alto → errático
+  const m = mean(nonZero);
+  const cv = m > 0 ? Math.sqrt(nonZero.reduce((a, v) => a + (v - m) ** 2, 0) / nonZero.length) / m : 999;
+
+  // Tendencia: comparar primer tercio vs último tercio
+  const third = Math.floor(n / 3);
+  const firstAvg = mean(series.slice(0, third));
+  const lastAvg = mean(series.slice(n - third));
+  const growth = firstAvg > 0 ? (lastAvg - firstAvg) / firstAvg : 0;
+
+  if (cv > 0.85) return { stage: "errático", confidence: "media", cv, growth };
+  if (growth > 0.20) return { stage: "crecimiento", confidence: growth > 0.4 ? "alta" : "media", cv, growth };
+  if (growth < -0.20) return { stage: "declive", confidence: growth < -0.4 ? "alta" : "media", cv, growth };
+  return { stage: "maduro", confidence: "alta", cv, growth };
+}
+
+// Modelo recomendado por etapa de ciclo de vida
+function recommendedModelForStage(stage) {
+  switch (stage) {
+    case "crecimiento": return "holt";
+    case "declive":     return "holt";
+    case "errático":    return "croston";
+    case "maduro":      return "hw";
+    case "nuevo":       return "ses";
+    default:            return null;
+  }
+}
+
+/* ============================================================
+   FVA – FORECAST VALUE ADD
+   ============================================================ */
+function seededRand(seed) {
+  const x = Math.sin(seed * 9301 + 49297) * 233280;
+  return x - Math.floor(x);
+}
+
+const COLLAB_DEFS = [
+  { name: "Valentina · Ventas",     bias:  0.18, noise: 0.15, icon: "V", color: "#7C3AED" },
+  { name: "Roberto · Marketing",    bias:  0.05, noise: 0.22, icon: "R", color: "#B5742A" },
+  { name: "Jorge · Operaciones",    bias: -0.05, noise: 0.09, icon: "J", color: "#0E6B63" },
+];
+
+const FVA_VERDICT = (fva) =>
+  fva == null ? { label: "Sin datos", color: "#9AA5B1" }
+  : fva > 0.03 ? { label: "✓ Agrega valor", color: "#0E6B63" }
+  : fva < -0.03 ? { label: "✗ Destruye valor", color: "#96402B" }
+  : { label: "≈ Neutral", color: "#B5742A" };
+
+/* ============================================================
+   REGISTRO DE MODELOS + BÚSQUEDA DE PARÁMETROS
+   ============================================================ */
+const ALPHAS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+const BETAS = [0.05, 0.1, 0.2, 0.3];
+const GAMMAS = [0.05, 0.1, 0.2, 0.3];
+const M = 12;
+
+const MODEL_DEFS = [
+  { key: "naive", label: "Naive (último valor)" },
+  { key: "snaive", label: "Naive Estacional (12m)" },
+  { key: "sma3", label: "Promedio Móvil (3m)" },
+  { key: "sma6", label: "Promedio Móvil (6m)" },
+  { key: "sma12", label: "Promedio Móvil (12m)" },
+  { key: "ses", label: "Suavizado Exp. Simple" },
+  { key: "holt", label: "Suavizado Exp. Doble (Holt)" },
+  { key: "hw", label: "Suavizado Exp. Triple (Holt-Winters)" },
+  { key: "linear", label: "Regresión Lineal" },
+  { key: "croston", label: "Croston / SBA (demanda intermitente)" },
+];
+
+function fitModel(y, key) {
+  const n = y.length;
+  if (key === "naive") {
+    if (n < 2) return null;
+    const fitted = new Array(n).fill(null);
+    for (let t = 1; t < n; t++) fitted[t] = y[t - 1];
+    const last = y[n - 1];
+    return { fitted, forecast: (h) => Array.from({ length: h }, () => last), paramsLabel: "—" };
+  }
+  if (key === "snaive") {
+    if (n < M + 1) return null;
+    const fitted = new Array(n).fill(null);
+    for (let t = M; t < n; t++) fitted[t] = y[t - M];
+    return { fitted, forecast: (h) => Array.from({ length: h }, (_, i) => y[n - M + (i % M)]), paramsLabel: "—" };
+  }
+  if (key === "sma3" || key === "sma6" || key === "sma12") {
+    const k = key === "sma3" ? 3 : key === "sma6" ? 6 : 12;
+    if (n < k + 1) return null;
+    const fitted = new Array(n).fill(null);
+    for (let t = k; t < n; t++) fitted[t] = mean(y.slice(t - k, t));
+    const lastAvg = mean(y.slice(n - k, n));
+    return { fitted, forecast: (h) => Array.from({ length: h }, () => lastAvg), paramsLabel: `k=${k}` };
+  }
+  if (key === "ses") {
+    if (n < 3) return null;
+    let best = null;
+    for (const a of ALPHAS) {
+      const r = sesFit(y, a);
+      const sse = sseFromFitted(y, r.fitted, 1);
+      if (!best || sse < best.sse) best = { ...r, sse, alpha: a };
+    }
+    return { ...best, paramsLabel: `α=${best.alpha.toFixed(1)}` };
+  }
+  if (key === "holt") {
+    if (n < 4) return null;
+    let best = null;
+    for (const a of ALPHAS) for (const b of BETAS) {
+      const r = holtFit(y, a, b);
+      if (!r) continue;
+      const sse = sseFromFitted(y, r.fitted, 2);
+      if (!best || sse < best.sse) best = { ...r, sse, alpha: a, beta: b };
+    }
+    if (!best) return null;
+    return { ...best, paramsLabel: `α=${best.alpha.toFixed(1)}, β=${best.beta.toFixed(2)}` };
+  }
+  if (key === "hw") {
+    if (n < 2 * M) return null;
+    let best = null;
+    for (const a of ALPHAS) for (const b of BETAS) for (const g of GAMMAS) {
+      const r = hwFit(y, a, b, g, M);
+      if (!r) continue;
+      const sse = sseFromFitted(y, r.fitted, M);
+      if (!best || sse < best.sse) best = { ...r, sse, alpha: a, beta: b, gamma: g };
+    }
+    if (!best) return null;
+    return { ...best, paramsLabel: `α=${best.alpha.toFixed(1)}, β=${best.beta.toFixed(2)}, γ=${best.gamma.toFixed(2)}` };
+  }
+  if (key === "linear") {
+    if (n < 3) return null;
+    const r = linearFit(y);
+    return { ...r, paramsLabel: `pendiente ${r.b >= 0 ? "+" : ""}${r.b.toFixed(1)}/mes` };
+  }
+  if (key === "croston") {
+    const r = crostonFit(y, 0.15);
+    if (!r) return null;
+    return { ...r, paramsLabel: "α=0.15 (SBA)" };
+  }
+  return null;
+}
+
+/* ============================================================
+   BACKTEST (selección automática del modelo) + FORECAST FINAL
+   ============================================================ */
+function runBacktest(series) {
+  const n = series.length;
+  const holdout = n >= 30 ? 12 : Math.max(3, Math.floor(n * 0.25));
+  const train = series.slice(0, n - holdout);
+  const test = series.slice(n - holdout);
+  const results = MODEL_DEFS.map((def) => {
+    const fit = fitModel(train, def.key);
+    if (!fit) return { ...def, insufficient: true };
+    const preds = fit.forecast(holdout);
+    const errors = calcErrors(test, preds);
+    return { ...def, ...errors, paramsLabel: fit.paramsLabel, preds };
+  });
+  const valid = results.filter((r) => !r.insufficient && r.wmape != null && isFinite(r.wmape));
+  valid.sort((x, y2) => x.wmape - y2.wmape);
+  const winnerKey = valid.length ? valid[0].key : "naive";
+  return { results, winnerKey, holdout, test };
+}
+
+function finalForecast(series, key, horizonMax) {
+  const fit = fitModel(series, key);
+  if (!fit) return null;
+  return { fittedHistory: fit.fitted, forecastFull: fit.forecast(horizonMax), paramsLabel: fit.paramsLabel };
+}
+
+/* ============================================================
+   INTERVALOS DE CONFIANZA (basados en residuos in-sample)
+   ============================================================ */
+function residualStd(series, fittedHistory) {
+  const residuals = [];
+  for (let i = 0; i < series.length; i++) {
+    if (fittedHistory[i] != null) residuals.push(series[i] - fittedHistory[i]);
+  }
+  if (residuals.length < 2) return null;
+  const m = mean(residuals);
+  const variance = residuals.reduce((acc, r) => acc + (r - m) ** 2, 0) / (residuals.length - 1);
+  return Math.sqrt(variance);
+}
+
+// z=1.645 → 90%, z=1.96 → 95%
+function forecastInterval(forecastVals, sigma, z = 1.645) {
+  if (sigma == null) return forecastVals.map((v) => ({ mid: v, low: v, high: v }));
+  return forecastVals.map((v, i) => {
+    // El error crece con el horizonte: √(h) (aproximación de random walk)
+    const widen = sigma * Math.sqrt(i + 1) * z;
+    return { mid: v, low: Math.max(0, Math.round(v - widen)), high: Math.round(v + widen) };
+  });
+}
+
+/* ============================================================
+   COBERTURA / EXCESO / OBSOLESCENCIA
+   ============================================================ */
+function coverageStatus(currentStock, avgDemand, forecastSum, monthsAhead) {
+  if (currentStock == null) return { months: null, label: "Sin stock ingresado", color: "#9AA5B1", flag: "none" };
+  if (avgDemand <= 0 && forecastSum <= 0) {
+    return currentStock > 0
+      ? { months: 999, label: "⚠ Obsoleto (sin demanda)", color: "#96402B", flag: "obsolete" }
+      : { months: 0, label: "Sin movimiento", color: "#9AA5B1", flag: "none" };
+  }
+  const months = avgDemand > 0 ? currentStock / avgDemand : 999;
+  if (months <= 0.5) return { months, label: "⚠ Quiebre inminente", color: "#96402B", flag: "stockout" };
+  if (months < 1) return { months, label: "↓ Cobertura crítica", color: "#B5742A", flag: "low" };
+  if (months > monthsAhead + 3) return { months, label: "↑ Sobrestock", color: "#B5742A", flag: "excess" };
+  if (months > monthsAhead + 6) return { months, label: "⚠ Exceso severo", color: "#96402B", flag: "excess" };
+  return { months, label: "✓ Saludable", color: "#0E6B63", flag: "ok" };
+}
+
+/* ============================================================
+   DETECCIÓN DE CAMBIO ESTRUCTURAL
+   Compara el nivel/tendencia de la ventana reciente vs. la histórica.
+   ============================================================ */
+function detectStructuralChange(series, dates) {
+  const n = series.length;
+  if (n < 18) return null;
+  const recentWin = Math.min(6, Math.floor(n / 4));
+  const recent = series.slice(n - recentWin);
+  const prior  = series.slice(0, n - recentWin);
+
+  const meanRecent = mean(recent);
+  const meanPrior  = mean(prior);
+  if (meanPrior <= 0) return null;
+
+  // Cambio de nivel
+  const levelChange = (meanRecent - meanPrior) / meanPrior;
+
+  // Desviación estándar de la base histórica
+  const sdPrior = Math.sqrt(prior.reduce((a, v) => a + (v - meanPrior) ** 2, 0) / prior.length);
+  const zScore = sdPrior > 0 ? (meanRecent - meanPrior) / (sdPrior / Math.sqrt(recentWin)) : 0;
+
+  // Cambio de tendencia: pendiente reciente vs. pendiente histórica
+  const slope = (arr) => {
+    const k = arr.length, tm = (k - 1) / 2, ym = mean(arr);
+    let num = 0, den = 0;
+    for (let i = 0; i < k; i++) { num += (i - tm) * (arr[i] - ym); den += (i - tm) ** 2; }
+    return den ? num / den : 0;
+  };
+  const slopeRecent = slope(recent);
+  const slopePrior  = slope(prior);
+
+  const significant = Math.abs(levelChange) > 0.20 && Math.abs(zScore) > 2.0;
+  if (!significant) return { detected: false, levelChange, zScore };
+
+  const direction = levelChange > 0 ? "alza" : "baja";
+  const lastDate = dates[n - 1];
+  return {
+    detected: true,
+    direction,
+    levelChange,
+    zScore,
+    meanRecent: Math.round(meanRecent),
+    meanPrior: Math.round(meanPrior),
+    recentWin,
+    slopeShift: slopeRecent - slopePrior,
+    label: `Demanda reciente ${Math.abs(levelChange * 100).toFixed(0)}% ${direction === "alza" ? "sobre" : "bajo"} su base histórica`,
+    fromLabel: dates[n - recentWin] ? monthLabel(dates[n - recentWin]) : "",
+    toLabel: lastDate ? monthLabel(lastDate) : "",
+  };
+}
+
+/* ============================================================
+   PROMOCIONES
+   Un período marcado como promo se "normaliza" para el entrenamiento
+   (se reemplaza por la mediana del entorno) y el uplift se re-agrega al forecast.
+   ============================================================ */
+function applyPromoBaseline(series, promoIndices) {
+  if (!promoIndices || promoIndices.size === 0) return series;
+  const clean = [...series];
+  const nonZero = series.filter((v, i) => !promoIndices.has(i) && v > 0);
+  const baseline = nonZero.length ? median(nonZero) : mean(series);
+  for (const i of promoIndices) {
+    // usar promedio de vecinos no-promo, si existen
+    const prev = i > 0 && !promoIndices.has(i - 1) ? series[i - 1] : null;
+    const next = i < series.length - 1 && !promoIndices.has(i + 1) ? series[i + 1] : null;
+    if (prev != null && next != null) clean[i] = Math.round((prev + next) / 2);
+    else if (prev != null) clean[i] = prev;
+    else if (next != null) clean[i] = next;
+    else clean[i] = Math.round(baseline);
+  }
+  return clean;
+}
+
+function median(arr) {
+  if (!arr.length) return 0;
+  const s = [...arr].sort((a, b) => a - b);
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+}
+
+/* ============================================================
+   GENERADOR DE DATOS SIMULADOS
+   ============================================================ */
+function generateSimulated() {
+  const months = 48;
+  const endY = 2026, endM = 4; // Mayo 2026
+  let startY = endY, startM = endM - (months - 1);
+  while (startM < 0) { startM += 12; startY -= 1; }
+  const dates = [];
+  for (let i = 0; i < months; i++) {
+    let yy = startY, mm = startM + i;
+    while (mm >= 12) { mm -= 12; yy += 1; }
+    dates.push({ y: yy, m: mm });
+  }
+  const seasonal = (m, amp, peak) => 1 + amp * Math.cos((2 * Math.PI * (m - peak)) / 12);
+  const noise = (s) => (Math.random() - 0.5) * 2 * s;
+
+  const defs = [
+    { sku: "SKU-A", name: "Bicicleta Urbana (tendencia + estacional)", gen: (i, m) => (58 + i * 1.4) * seasonal(m, 0.3, 10) + noise(7) },
+    { sku: "SKU-B", name: 'Tornillo 1/4" (demanda estable)', gen: (i, m) => 85 * seasonal(m, 0.07, 5) + noise(6) },
+    { sku: "SKU-C", name: "Piscina Inflable (alta estacionalidad)", gen: (i, m) => (46 - i * 0.05) * seasonal(m, 0.85, 0) + noise(5) },
+    { sku: "SKU-D", name: "Repuesto Especial (demanda intermitente)", gen: () => (Math.random() < 0.72 ? 0 : Math.round(10 + Math.random() * 30)) },
+    { sku: "SKU-E", name: "Cargador Modelo Antiguo (tendencia decreciente)", gen: (i, m) => (138 - i * 2.3) * seasonal(m, 0.1, 6) + noise(6) },
+    // Cambio estructural: salto de nivel en los últimos 5 meses (nuevo cliente grande)
+    { sku: "SKU-F", name: "Filtro Industrial (cambio estructural reciente)", gen: (i, m) => {
+        const base = 70 * seasonal(m, 0.12, 6) + noise(6);
+        return i >= months - 5 ? base * 1.7 : base;  // +70% desde hace 5 meses
+      } },
+  ];
+
+  const out = {};
+  // Mezcla de sucursales simulada (cada SKU con un reparto distinto entre 4 locales)
+  const BRANCH_MIXES = {
+    "SKU-A": { "Providencia": 0.40, "Las Condes": 0.30, "Maipú": 0.18, "Viña del Mar": 0.12 },
+    "SKU-B": { "Providencia": 0.22, "Las Condes": 0.20, "Maipú": 0.35, "Viña del Mar": 0.23 },
+    "SKU-C": { "Providencia": 0.15, "Las Condes": 0.18, "Maipú": 0.25, "Viña del Mar": 0.42 },
+    "SKU-D": { "Providencia": 0.30, "Las Condes": 0.45, "Maipú": 0.15, "Viña del Mar": 0.10 },
+    "SKU-E": { "Providencia": 0.28, "Las Condes": 0.28, "Maipú": 0.24, "Viña del Mar": 0.20 },
+    "SKU-F": { "Providencia": 0.50, "Las Condes": 0.35, "Maipú": 0.10, "Viña del Mar": 0.05 },
+  };
+  for (const d of defs) {
+    const series = dates.map((dt, i) => Math.max(0, Math.round(d.gen(i, dt.m))));
+    out[d.sku] = { name: d.name, dates: dates.map((x) => ({ ...x })), series, branchMix: BRANCH_MIXES[d.sku] };
+  }
+  return out;
+}
+
+/* ============================================================
+   LECTOR DE CSV
+   ============================================================ */
+function parseFlexibleDate(raw) {
+  if (!raw) return null;
+  const s = String(raw).trim();
+  let m = s.match(/^(\d{4})-(\d{1,2})/);
+  if (m) return { y: parseInt(m[1]), m: parseInt(m[2]) - 1 };
+  m = s.match(/^(\d{1,2})\/(\d{4})$/);
+  if (m) return { y: parseInt(m[2]), m: parseInt(m[1]) - 1 };
+  m = s.match(/^(\d{1,2})-(\d{4})$/);
+  if (m) return { y: parseInt(m[2]), m: parseInt(m[1]) - 1 };
+  return null;
+}
+
+function parseCsvToSkuData(text) {
+  const result = Papa.parse(text, { header: true, skipEmptyLines: true });
+  if (!result.meta.fields) return { error: "No se pudo leer el encabezado del archivo." };
+  const fields = result.meta.fields;
+  const lower = fields.map((f) => f.toLowerCase().trim());
+  const findCol = (cands) => {
+    for (const c of cands) { const idx = lower.indexOf(c); if (idx >= 0) return fields[idx]; }
+    return null;
+  };
+  const skuCol = findCol(["sku", "código", "codigo"]);
+  const dateCol = findCol(["fecha", "mes", "periodo"]);
+  const valCol = findCol(["venta", "ventas", "demanda", "cantidad", "unidades"]);
+  const branchCol = findCol(["sucursal", "local", "tienda", "bodega", "centro", "branch", "store"]);
+  const nameCol = findCol(["nombre", "descripcion", "descripción", "detalle"]);
+  if (!skuCol || !dateCol || !valCol) {
+    return { error: "El archivo debe tener columnas SKU, Fecha (YYYY-MM) y Venta." };
+  }
+  const bySku = {};
+  const branchTotals = {};       // { sku: { branch: total } }
+  const allBranches = new Set();
+  const skuNames = {};
+  for (const row of result.data) {
+    const sku = row[skuCol];
+    if (!sku) continue;
+    const dt = parseFlexibleDate(row[dateCol]);
+    const val = parseFloat(row[valCol]);
+    if (!dt || isNaN(val)) continue;
+    if (nameCol && row[nameCol] && !skuNames[sku]) skuNames[sku] = row[nameCol];
+    // Agregación total (SKU-mes), sumando sucursales si existen
+    if (!bySku[sku]) bySku[sku] = {};
+    const key = `${dt.y}-${dt.m}`;
+    if (!bySku[sku][key]) bySku[sku][key] = { dt, val: 0 };
+    bySku[sku][key].val += val;
+    // Mezcla por sucursal
+    if (branchCol) {
+      const branch = row[branchCol] || "Sin sucursal";
+      allBranches.add(branch);
+      if (!branchTotals[sku]) branchTotals[sku] = {};
+      branchTotals[sku][branch] = (branchTotals[sku][branch] || 0) + val;
+    }
+  }
+  const out = {};
+  for (const sku in bySku) {
+    const pts = Object.values(bySku[sku]).sort((a, b) => a.dt.y - b.dt.y || a.dt.m - b.dt.m);
+    // Calcular mezcla porcentual por sucursal
+    let branchMix = null;
+    if (branchCol && branchTotals[sku]) {
+      const total = Object.values(branchTotals[sku]).reduce((a, b) => a + b, 0);
+      branchMix = {};
+      for (const b in branchTotals[sku]) branchMix[b] = total > 0 ? branchTotals[sku][b] / total : 0;
+    }
+    out[sku] = { name: skuNames[sku] || sku, dates: pts.map((p) => p.dt), series: pts.map((p) => p.val), branchMix };
+  }
+  if (Object.keys(out).length === 0) return { error: "No se encontraron filas válidas." };
+  return { data: out, branches: branchCol ? [...allBranches].sort() : null };
+}
+
+/* ============================================================
+   GRÁFICO: combinar histórico + forecast
+   ============================================================ */
+function buildChartData(dates, series, finalFc, horizon, sigma) {
+  const n = series.length;
+  const data = dates.map((d, i) => ({
+    month: monthLabel(d),
+    real: series[i],
+    ajuste: finalFc.fittedHistory[i] != null ? Math.round(finalFc.fittedHistory[i] * 10) / 10 : null,
+    forecast: null,
+    low: null,
+    band: null,
+  }));
+  const intervals = forecastInterval(finalFc.forecastFull.slice(0, horizon), sigma, 1.645);
+  for (let i = 0; i < horizon; i++) {
+    const d = addMonths(dates[n - 1], i + 1);
+    const iv = intervals[i];
+    data.push({
+      month: monthLabel(d),
+      real: null, ajuste: null,
+      forecast: Math.round(finalFc.forecastFull[i] * 10) / 10,
+      low: iv.low,
+      band: iv.high - iv.low,   // para apilar el área
+      high: iv.high,
+    });
+  }
+  return data;
+}
+
+/* ============================================================
+   COMPONENTES PEQUEÑOS DE UI
+   ============================================================ */
+function Stamp() {
+  return (
+    <span
+      className="inline-block px-2 py-0.5 text-[10px] font-bold uppercase font-mono"
+      style={{
+        color: COLORS.accent,
+        border: `2px dashed ${COLORS.accent}`,
+        borderRadius: 4,
+        transform: "rotate(-3deg)",
+        letterSpacing: "0.08em",
+      }}
+    >
+      seleccionado
+    </span>
+  );
+}
+
+function Card({ children, style }) {
+  return (
+    <div
+      className="rounded-md border p-4"
+      style={{ background: COLORS.panel, borderColor: COLORS.border, ...style }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function Eyebrow({ children }) {
+  return (
+    <div
+      className="text-xs font-mono uppercase tracking-widest mb-1"
+      style={{ color: COLORS.inkMuted, letterSpacing: "0.1em" }}
+    >
+      {children}
+    </div>
+  );
+}
+
+/* ============================================================
+   APP PRINCIPAL
+   ============================================================ */
+export default function DemandForecastApp() {
+  const [skuData, setSkuData] = useState(null);
+  const [selectedSku, setSelectedSku] = useState(null);
+  const [horizon, setHorizon] = useState(6);
+  const [csvError, setCsvError] = useState(null);
+  const [modelOverrides, setModelOverrides] = useState({});
+  const [backtestView, setBacktestView] = useState({});
+  const [view, setView] = useState("detalle");
+  const [chartSku, setChartSku] = useState("TOTAL");
+  const [chartType, setChartType] = useState("line");
+  const [useCleanData, setUseCleanData] = useState({});
+  // Inventario: parámetros globales
+  const [globalLT, setGlobalLT] = useState(2);
+  const [globalSL, setGlobalSL] = useState(95);
+  const [globalReview, setGlobalReview] = useState(1);
+  const [useAbcSL, setUseAbcSL] = useState(true);
+  // Overrides por SKU
+  const [ltOverrides, setLtOverrides] = useState({});
+  const [currentStock, setCurrentStock] = useState({});
+  // FVA & ajuste colaborativo
+  const [collaboratorList, setCollaboratorList] = useState(COLLAB_DEFS.map((c) => c.name));
+  const [selectedCollab, setSelectedCollab] = useState(COLLAB_DEFS[0].name);
+  const [newCollabInput, setNewCollabInput] = useState("");
+  const [savedAdjustments, setSavedAdjustments] = useState([]);   // {id,sku,monthKey,monthLabel,statistical,adjusted,collaborator,comment,actual}
+  const [adjInputs, setAdjInputs] = useState({});                 // {monthKey: {value, comment}}
+  const [fvaSku, setFvaSku] = useState(null);
+  // Promociones: { sku: Set(indices históricos marcados como promo) }
+  const [promoHist, setPromoHist] = useState({});
+  // Uplift futuro: { sku: { monthOffset: pct } }  ej {0: 0.3} = +30% el mes +1
+  const [promoFuture, setPromoFuture] = useState({});
+  const [promoSku, setPromoSku] = useState(null);
+  // Top-down por sucursal
+  const [branches, setBranches] = useState(null);   // lista de sucursales (del CSV o demo)
+  const [branchView, setBranchView] = useState("ALL");
+
+  const allOutliers = useMemo(() => {
+    if (!skuData) return {};
+    const out = {};
+    for (const sku in skuData) out[sku] = detectOutliers(skuData[sku].series);
+    return out;
+  }, [skuData]);
+
+  const structuralAlerts = useMemo(() => {
+    if (!skuData) return {};
+    const out = {};
+    for (const sku in skuData) out[sku] = detectStructuralChange(skuData[sku].series, skuData[sku].dates);
+    return out;
+  }, [skuData]);
+
+  const lifecycle = useMemo(() => {
+    if (!skuData) return {};
+    const out = {};
+    for (const sku in skuData) out[sku] = detectLifecycle(skuData[sku].series, skuData[sku].dates);
+    return out;
+  }, [skuData]);
+
+  const effectiveSeries = useMemo(() => {
+    if (!skuData) return {};
+    const out = {};
+    for (const sku in skuData) {
+      let s = skuData[sku].series;
+      // 1. Limpieza de outliers
+      if (useCleanData[sku] && allOutliers[sku]?.length) s = applyClean(s, allOutliers[sku]);
+      // 2. Normalización de promociones históricas
+      if (promoHist[sku] && promoHist[sku].size > 0) s = applyPromoBaseline(s, promoHist[sku]);
+      out[sku] = s;
+    }
+    return out;
+  }, [skuData, useCleanData, allOutliers, promoHist]);
+
+  const abcxyz = useMemo(() => {
+    if (!skuData) return null;
+    return classifyABCXYZ(skuData);
+  }, [skuData]);
+
+  const analysis = useMemo(() => {
+    if (!skuData) return null;
+    const out = {};
+    for (const sku in skuData) out[sku] = runBacktest(effectiveSeries[sku]);
+    return out;
+  }, [effectiveSeries]);
+
+  const inventoryRows = useMemo(() => {
+    if (!skuData || !analysis || !abcxyz) return null;
+    return Object.keys(skuData).map((sku) => {
+      const s = effectiveSeries[sku];
+      const usedKey = modelOverrides[sku] || analysis[sku].winnerKey;
+      const fc = finalForecast(s, usedKey, 12);
+      const forecast12 = fc ? fc.forecastFull : [];
+      const abc = abcxyz[sku]?.abc || "C";
+      const lt = ltOverrides[sku] != null ? ltOverrides[sku] : globalLT;
+      const sl = useAbcSL ? SL_BY_ABC[abc] : globalSL;
+      const metrics = calcInventory(s, forecast12, lt, sl, globalReview);
+      const cs = currentStock[sku] != null ? Number(currentStock[sku]) : null;
+      const gap = cs != null ? cs - metrics.rop : null;
+      const suggestedOrder = cs != null ? Math.max(0, metrics.maxStock - cs) : null;
+      const stockMonths = cs != null && metrics.avgDemand > 0 ? (cs / metrics.avgDemand).toFixed(1) : null;
+      const fcSum = forecast12.reduce((a, b) => a + b, 0);
+      const coverage = coverageStatus(cs, metrics.avgDemand, fcSum, globalReview + lt);
+      return { sku, name: skuData[sku].name, abc, xyz: abcxyz[sku]?.xyz, cell: abcxyz[sku]?.cell, lt, sl, ...metrics, cs, gap, suggestedOrder, stockMonths, coverage };
+    }).sort((a, b) => { const o = { A: 0, B: 1, C: 2 }; return o[a.abc] - o[b.abc] || b.avgDemand - a.avgDemand; });
+  }, [skuData, analysis, abcxyz, effectiveSeries, modelOverrides, ltOverrides, currentStock, globalLT, globalSL, globalReview, useAbcSL]);
+
+  // FVA simulado: usa el holdout del backtest como "pasado conocido"
+  const historicalFVA = useMemo(() => {
+    if (!skuData || !analysis) return [];
+    const records = [];
+    const skuKeys = Object.keys(skuData);
+    for (const sku of skuKeys) {
+      const bt = analysis[sku];
+      const winnerRow = bt.results.find((r) => r.key === bt.winnerKey);
+      if (!winnerRow || !winnerRow.preds || bt.test.length === 0) continue;
+      const holdoutDates = skuData[sku].dates.slice(-bt.holdout);
+      for (let i = 0; i < bt.test.length; i++) {
+        const stat = Math.max(0, winnerRow.preds[i] || 0);
+        const actual = bt.test[i];
+        const seed = sku.charCodeAt(sku.length - 1) * 100 + i;
+        const collabIdx = Math.floor(seededRand(seed * 3) * COLLAB_DEFS.length);
+        const collab = COLLAB_DEFS[collabIdx];
+        const biasFactor = collab.bias + (seededRand(seed) - 0.5) * 2 * collab.noise;
+        const adjusted = Math.max(0, Math.round(stat * (1 + biasFactor)));
+        const dt = holdoutDates[i] || { y: 2025, m: i };
+        records.push({ sku, monthKey: `${dt.y}-${String(dt.m + 1).padStart(2, "0")}`, monthLbl: monthLabel(dt), statistical: Math.round(stat * 10) / 10, adjusted, actual, collaborator: collab.name });
+      }
+    }
+    return records;
+  }, [skuData, analysis]);
+
+  const fvaMetrics = useMemo(() => {
+    const allRecords = [
+      ...historicalFVA,
+      ...savedAdjustments.filter((a) => a.actual != null).map((a) => ({
+        sku: a.sku, monthKey: a.monthKey, monthLbl: a.monthLabel,
+        statistical: a.statistical, adjusted: a.adjusted, actual: a.actual, collaborator: a.collaborator,
+      })),
+    ];
+    if (allRecords.length === 0) return [];
+    const byCollab = {};
+    for (const r of allRecords) {
+      if (!byCollab[r.collaborator]) byCollab[r.collaborator] = [];
+      byCollab[r.collaborator].push(r);
+    }
+    return Object.entries(byCollab).map(([name, recs]) => {
+      const totalActual = recs.reduce((s, r) => s + r.actual, 0);
+      const statErr = recs.reduce((s, r) => s + Math.abs(r.actual - r.statistical), 0);
+      const adjErr  = recs.reduce((s, r) => s + Math.abs(r.actual - r.adjusted), 0);
+      const statWmape = totalActual > 0 ? statErr / totalActual : null;
+      const adjWmape  = totalActual > 0 ? adjErr  / totalActual : null;
+      const fva = statWmape != null && adjWmape != null ? statWmape - adjWmape : null;
+      const improved = recs.filter((r) => Math.abs(r.actual - r.adjusted) < Math.abs(r.actual - r.statistical)).length;
+      const avgBias = recs.reduce((s, r) => s + (r.adjusted - r.statistical), 0) / recs.length;
+      return { name, count: recs.length, statWmape, adjWmape, fva, improved, pctImproved: improved / recs.length, avgBias };
+    }).sort((a, b) => (b.fva ?? -99) - (a.fva ?? -99));
+  }, [historicalFVA, savedAdjustments]);
+
+  // Score de salud del portafolio (0-100)
+  const healthScore = useMemo(() => {
+    if (!skuData || !analysis || !inventoryRows) return null;
+    const skus = Object.keys(skuData);
+    const n = skus.length;
+
+    // 1. Precisión del forecast (40 pts): basado en WMAPE promedio ponderado
+    let wmapeSum = 0, wmapeCount = 0;
+    for (const sku of skus) {
+      const w = analysis[sku].results.find((r) => r.key === analysis[sku].winnerKey)?.wmape;
+      if (w != null && isFinite(w)) { wmapeSum += w; wmapeCount++; }
+    }
+    const avgWmape = wmapeCount > 0 ? wmapeSum / wmapeCount : 0.5;
+    const accuracyScore = Math.max(0, Math.min(40, 40 * (1 - avgWmape / 0.5)));
+
+    // 2. Salud de inventario (35 pts): penaliza quiebres y excesos
+    const withStock = inventoryRows.filter((r) => r.cs != null);
+    let stockoutCount = 0, excessCount = 0, obsoleteCount = 0;
+    for (const r of withStock) {
+      const f = r.coverage?.flag;
+      if (f === "stockout" || f === "low") stockoutCount++;
+      else if (f === "excess") excessCount++;
+      else if (f === "obsolete") obsoleteCount++;
+    }
+    const stockPenalty = withStock.length > 0
+      ? ((stockoutCount * 1.0 + excessCount * 0.6 + obsoleteCount * 0.8) / withStock.length) * 35
+      : 0;
+    const inventoryScore = Math.max(0, 35 - stockPenalty);
+
+    // 3. Estabilidad / calidad de datos (25 pts): penaliza outliers y SKUs erráticos (Z)
+    let outlierFlags = 0, zCount = 0;
+    for (const sku of skus) {
+      if (allOutliers[sku]?.length) outlierFlags++;
+      if (abcxyz[sku]?.xyz === "Z") zCount++;
+    }
+    const dataPenalty = ((outlierFlags * 0.5 + zCount * 0.5) / n) * 25;
+    const dataScore = Math.max(0, 25 - dataPenalty);
+
+    const total = Math.round(accuracyScore + inventoryScore + dataScore);
+
+    const issues = [];
+    if (accuracyScore < 28) issues.push({ text: `Precisión de forecast mejorable (WMAPE prom. ${(avgWmape * 100).toFixed(1)}%)`, pts: Math.round(40 - accuracyScore) });
+    if (stockoutCount > 0) issues.push({ text: `${stockoutCount} SKU(s) en quiebre o cobertura crítica`, pts: Math.round((stockoutCount / Math.max(1, withStock.length)) * 35) });
+    if (excessCount > 0) issues.push({ text: `${excessCount} SKU(s) con sobrestock`, pts: Math.round((excessCount / Math.max(1, withStock.length)) * 21) });
+    if (obsoleteCount > 0) issues.push({ text: `${obsoleteCount} SKU(s) candidato a obsoleto`, pts: Math.round((obsoleteCount / Math.max(1, withStock.length)) * 28) });
+    if (outlierFlags > 0) issues.push({ text: `${outlierFlags} SKU(s) con anomalías de datos sin limpiar`, pts: Math.round((outlierFlags / n) * 12) });
+    if (zCount > 0) issues.push({ text: `${zCount} SKU(s) con demanda errática (clase Z)`, pts: Math.round((zCount / n) * 12) });
+    if (withStock.length === 0) issues.push({ text: "Ingresa stock actual en Inventario para evaluar cobertura", pts: 0 });
+
+    const grade = total >= 85 ? { label: "Excelente", color: "#0E6B63" }
+      : total >= 70 ? { label: "Bueno", color: "#1A8A7A" }
+      : total >= 50 ? { label: "Requiere atención", color: "#B5742A" }
+      : { label: "Crítico", color: "#96402B" };
+
+    return {
+      total, grade,
+      breakdown: [
+        { label: "Precisión forecast", score: Math.round(accuracyScore), max: 40 },
+        { label: "Salud de inventario", score: Math.round(inventoryScore), max: 35 },
+        { label: "Calidad de datos", score: Math.round(dataScore), max: 25 },
+      ],
+      issues: issues.sort((a, b) => b.pts - a.pts),
+    };
+  }, [skuData, analysis, inventoryRows, allOutliers, abcxyz]);
+
+  const portfolio = useMemo(() => {
+    if (!skuData || !analysis) return null;
+    let last12 = 0, fcTotal = 0;
+    for (const sku in skuData) {
+      const s = effectiveSeries[sku];
+      last12 += s.slice(Math.max(0, s.length - 12)).reduce((a, b) => a + b, 0);
+      const fc = finalForecast(s, analysis[sku].winnerKey, 24);
+      if (fc) fcTotal += fc.forecastFull.slice(0, horizon).reduce((a, b) => a + b, 0);
+    }
+    return { last12, fcTotal, count: Object.keys(skuData).length };
+  }, [skuData, analysis, effectiveSeries, horizon]);
+
+  const futureMonthLabels = useMemo(() => {
+    if (!skuData) return [];
+    const skus = Object.keys(skuData);
+    const lastDates = skus.map((s) => skuData[s].dates[skuData[s].dates.length - 1]);
+    const allSame = lastDates.every((d) => d.y === lastDates[0].y && d.m === lastDates[0].m);
+    if (allSame) return Array.from({ length: horizon }, (_, i) => monthLabel(addMonths(lastDates[0], i + 1)));
+    return Array.from({ length: horizon }, (_, i) => `Mes +${i + 1}`);
+  }, [skuData, horizon]);
+
+  const summaryRows = useMemo(() => {
+    if (!skuData || !analysis) return null;
+    return Object.keys(skuData).map((sku) => {
+      const winnerKey = analysis[sku].winnerKey;
+      const usedKey = modelOverrides[sku] || winnerKey;
+      const fc = finalForecast(effectiveSeries[sku], usedKey, 24);
+      const wmape = analysis[sku].results.find((r) => r.key === usedKey)?.wmape;
+      const last12 = skuData[sku].series.slice(-12).reduce((a, b) => a + b, 0);
+      const upliftMap = promoFuture[sku] || {};
+      const monthly = fc ? fc.forecastFull.slice(0, horizon).map((v, i) => upliftMap[i] ? Math.round(v * (1 + upliftMap[i])) : v) : [];
+      const total = monthly.reduce((a, b) => a + b, 0);
+      const hasPromo = Object.keys(upliftMap).some((k) => k < horizon && upliftMap[k]);
+      return {
+        sku,
+        name: skuData[sku].name,
+        modelLabel: MODEL_DEFS.find((m) => m.key === usedKey)?.label || usedKey,
+        isWinner: usedKey === winnerKey,
+        wmape,
+        last12,
+        monthly,
+        total,
+        hasPromo,
+      };
+    });
+  }, [skuData, analysis, modelOverrides, horizon, effectiveSeries, promoFuture]);
+
+  // Top-down: desagrega el forecast de cada SKU a las sucursales según su mezcla histórica
+  const branchBreakdown = useMemo(() => {
+    if (!skuData || !analysis || !branches || !summaryRows) return null;
+    const rows = [];
+    for (const row of summaryRows) {
+      const mix = skuData[row.sku].branchMix;
+      if (!mix) continue;
+      for (const branch of branches) {
+        const share = mix[branch] || 0;
+        const monthly = row.monthly.map((v) => Math.round(v * share));
+        const total = monthly.reduce((a, b) => a + b, 0);
+        rows.push({ sku: row.sku, name: row.name, branch, share, monthly, total });
+      }
+    }
+    return rows;
+  }, [skuData, analysis, branches, summaryRows]);
+
+  // Totales por sucursal (suma de todos los SKU)
+  const branchTotals = useMemo(() => {
+    if (!branchBreakdown || !branches) return null;
+    return branches.map((branch) => {
+      const rows = branchBreakdown.filter((r) => r.branch === branch);
+      const total = rows.reduce((a, r) => a + r.total, 0);
+      return { branch, total, skuCount: rows.filter((r) => r.total > 0).length };
+    }).sort((a, b) => b.total - a.total);
+  }, [branchBreakdown, branches]);
+
+  const aggregateSeries = useMemo(() => {
+    if (!skuData || !analysis) return null;
+    if (chartSku === "TOTAL") {
+      const histMap = new Map();
+      for (const sku in skuData) {
+        const { dates } = skuData[sku];
+        const series = effectiveSeries[sku];
+        dates.forEach((d, i) => {
+          const key = d.y * 12 + d.m;
+          if (!histMap.has(key)) histMap.set(key, { date: d, value: 0 });
+          histMap.get(key).value += series[i];
+        });
+      }
+      const historyPoints = Array.from(histMap.values()).sort((a, b) => a.date.y * 12 + a.date.m - (b.date.y * 12 + b.date.m));
+      const globalLastKey = Math.max(
+        ...Object.keys(skuData).map((s) => {
+          const d = skuData[s].dates[skuData[s].dates.length - 1];
+          return d.y * 12 + d.m;
+        })
+      );
+      const fcMap = new Map();
+      for (const sku in skuData) {
+        const usedKey = modelOverrides[sku] || analysis[sku].winnerKey;
+        const fc = finalForecast(skuData[sku].series, usedKey, 24);
+        if (!fc) continue;
+        const lastDate = skuData[sku].dates[skuData[sku].dates.length - 1];
+        for (let i = 0; i < 24; i++) {
+          const d = addMonths(lastDate, i + 1);
+          const key = d.y * 12 + d.m;
+          if (key <= globalLastKey) continue;
+          if (!fcMap.has(key)) fcMap.set(key, { date: d, value: 0 });
+          fcMap.get(key).value += fc.forecastFull[i];
+        }
+      }
+      const forecastPoints = Array.from(fcMap.values())
+        .sort((a, b) => a.date.y * 12 + a.date.m - (b.date.y * 12 + b.date.m))
+        .slice(0, horizon);
+      return { historyPoints, forecastPoints };
+    }
+    const sku = chartSku;
+    if (!skuData[sku]) return null;
+    const { dates } = skuData[sku];
+    const series = effectiveSeries[sku];
+    const usedKey = modelOverrides[sku] || analysis[sku].winnerKey;
+    const fc = finalForecast(series, usedKey, 24);
+    const historyPoints = dates.map((d, i) => ({ date: d, value: series[i] }));
+    const lastDate = dates[dates.length - 1];
+    const forecastPoints = fc
+      ? Array.from({ length: horizon }, (_, i) => ({ date: addMonths(lastDate, i + 1), value: fc.forecastFull[i] }))
+      : [];
+    return { historyPoints, forecastPoints };
+  }, [skuData, analysis, modelOverrides, chartSku, horizon]);
+
+  const aggChartData = useMemo(() => {
+    if (!aggregateSeries) return null;
+    const data = aggregateSeries.historyPoints.map((p) => ({ month: monthLabel(p.date), real: Math.round(p.value * 10) / 10, forecast: null }));
+    aggregateSeries.forecastPoints.forEach((p) => data.push({ month: monthLabel(p.date), real: null, forecast: Math.round(p.value * 10) / 10 }));
+    return data;
+  }, [aggregateSeries]);
+
+  function exportSummaryCsv() {
+    if (!summaryRows) return;
+    const header = ["SKU", "Nombre", "Modelo", "WMAPE", ...futureMonthLabels, "Total horizonte"];
+    const lines = [header.join(",")];
+    for (const row of summaryRows) {
+      const vals = [
+        row.sku,
+        `"${row.name}"`,
+        `"${row.modelLabel}"`,
+        row.wmape != null ? `${(row.wmape * 100).toFixed(1)}%` : "",
+        ...row.monthly.map((v) => Math.round(v * 10) / 10),
+        Math.round(row.total * 10) / 10,
+      ];
+      lines.push(vals.join(","));
+    }
+    const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "forecast_resumen.csv";
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function handleGenerate() {
+    const data = generateSimulated();
+    setSkuData(data);
+    setSelectedSku(Object.keys(data)[0]);
+    setModelOverrides({});
+    setBacktestView({});
+    setCsvError(null);
+    setChartSku("TOTAL");
+    setUseCleanData({});
+    setLtOverrides({});
+    setCurrentStock({});
+    setSavedAdjustments([]);
+    setAdjInputs({});
+    setFvaSku(Object.keys(data)[0]);
+    setPromoHist({});
+    setPromoFuture({});
+    setPromoSku(Object.keys(data)[0]);
+    // Sucursales del demo
+    const demoBranches = ["Providencia", "Las Condes", "Maipú", "Viña del Mar"];
+    setBranches(demoBranches);
+    setBranchView("ALL");
+  }
+
+  function handleFile(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const res = parseCsvToSkuData(String(ev.target.result));
+      if (res.error) { setCsvError(res.error); return; }
+      setSkuData(res.data);
+      setSelectedSku(Object.keys(res.data)[0]);
+      setModelOverrides({});
+      setBacktestView({});
+      setCsvError(null);
+      setChartSku("TOTAL");
+      setUseCleanData({});
+      setLtOverrides({});
+      setCurrentStock({});
+      setSavedAdjustments([]);
+      setAdjInputs({});
+      setFvaSku(Object.keys(res.data)[0]);
+      setPromoHist({});
+      setPromoFuture({});
+      setPromoSku(Object.keys(res.data)[0]);
+      setBranches(res.branches || null);
+      setBranchView("ALL");
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  }
+
+  const currentSku = selectedSku;
+  const currentSeries = skuData && currentSku ? effectiveSeries[currentSku] : null;
+  const currentSeriesRaw = skuData && currentSku ? skuData[currentSku].series : null;
+  const currentDates = skuData && currentSku ? skuData[currentSku].dates : null;
+  const currentOutliers = currentSku ? (allOutliers[currentSku] || []) : [];
+  const currentClean = !!(currentSku && useCleanData[currentSku]);
+  const currentBacktest = analysis && currentSku ? analysis[currentSku] : null;
+  const usedModelKey = currentSku ? (modelOverrides[currentSku] || (currentBacktest ? currentBacktest.winnerKey : "naive")) : null;
+
+  const finalFc = useMemo(() => {
+    if (!currentSeries || !usedModelKey) return null;
+    const base = finalForecast(currentSeries, usedModelKey, 24);
+    if (!base) return null;
+    // Aplicar uplift de promociones futuras
+    const upliftMap = promoFuture[currentSku] || {};
+    if (Object.keys(upliftMap).length > 0) {
+      const adjusted = base.forecastFull.map((v, i) => {
+        const up = upliftMap[i];
+        return up ? Math.round(v * (1 + up)) : v;
+      });
+      return { ...base, forecastFull: adjusted, baseForecast: base.forecastFull, hasPromo: true };
+    }
+    return { ...base, baseForecast: base.forecastFull, hasPromo: false };
+  }, [currentSeries, usedModelKey, promoFuture, currentSku]);
+
+  const currentSigma = useMemo(() => {
+    if (!currentSeries || !finalFc) return null;
+    return residualStd(currentSeries, finalFc.fittedHistory);
+  }, [currentSeries, finalFc]);
+
+  const chartData = useMemo(() => {
+    if (!currentDates || !currentSeries || !finalFc) return null;
+    return buildChartData(currentDates, currentSeries, finalFc, horizon, currentSigma);
+  }, [currentDates, currentSeries, finalFc, horizon, currentSigma]);
+
+  const usedResultRow = currentBacktest && usedModelKey
+    ? currentBacktest.results.find((r) => r.key === usedModelKey) : null;
+
+  const horizonTotal = finalFc ? finalFc.forecastFull.slice(0, horizon).reduce((a, b) => a + b, 0) : null;
+
+  const sortedResults = currentBacktest
+    ? [...currentBacktest.results].sort((a, b) => {
+        if (a.insufficient && !b.insufficient) return 1;
+        if (!a.insufficient && b.insufficient) return -1;
+        if (a.insufficient && b.insufficient) return 0;
+        return a.wmape - b.wmape;
+      })
+    : [];
+
+  const backtestKey = (currentSku && backtestView[currentSku]) || usedModelKey;
+  const backtestRow = currentBacktest ? currentBacktest.results.find((r) => r.key === backtestKey) : null;
+  const backtestDates = currentDates && currentBacktest ? currentDates.slice(currentDates.length - currentBacktest.holdout) : null;
+
+  return (
+    <div style={{ background: COLORS.bg, minHeight: "100vh" }} className="w-full">
+      {/* HEADER */}
+      <div className="border-b px-6 py-5" style={{ borderColor: COLORS.border, background: COLORS.panel }}>
+        <Eyebrow>demand planning · sku agregado · salud + intervalos</Eyebrow>
+        <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4">
+          <div>
+            <h1 className="text-2xl font-semibold tracking-tight" style={{ color: COLORS.ink }}>
+              Motor de Forecast de Demanda
+            </h1>
+            <p className="text-sm mt-1" style={{ color: COLORS.inkMuted }}>
+              Compara modelos estadísticos por SKU, selecciona automáticamente el de menor error y proyecta a futuro.
+            </p>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <button
+              onClick={handleGenerate}
+              className="flex items-center gap-2 px-3 py-2 rounded-md text-sm font-medium"
+              style={{ background: COLORS.accent, color: "#fff" }}
+            >
+              <RefreshCw size={15} /> Generar datos simulados
+            </button>
+            <label
+              className="flex items-center gap-2 px-3 py-2 rounded-md text-sm font-medium border cursor-pointer"
+              style={{ borderColor: COLORS.border, color: COLORS.ink, background: COLORS.panelAlt }}
+            >
+              <Upload size={15} /> Subir CSV
+              <input type="file" accept=".csv" className="hidden" onChange={handleFile} />
+            </label>
+          </div>
+        </div>
+        {csvError && (
+          <div className="mt-3 text-sm px-3 py-2 rounded-md" style={{ background: COLORS.amberSoft, color: COLORS.brick }}>
+            {csvError}
+          </div>
+        )}
+        <p className="text-xs mt-3" style={{ color: COLORS.inkMuted }}>
+          Formato CSV esperado: columnas <span className="font-mono">SKU</span>, <span className="font-mono">Fecha</span> (YYYY-MM) y{" "}
+          <span className="font-mono">Venta</span>. Opcional: <span className="font-mono">Sucursal</span> (activa el top-down por local) y <span className="font-mono">Nombre</span>.
+        </p>
+      </div>
+
+      {!skuData ? (
+        <div className="flex items-center justify-center py-24 px-6">
+          <Card style={{ maxWidth: 480, textAlign: "center" }}>
+            <Info size={28} style={{ color: COLORS.accent, margin: "0 auto" }} />
+            <p className="mt-3 text-sm" style={{ color: COLORS.ink }}>
+              Aún no hay datos cargados. Genera un set simulado de 5 SKUs con 48 meses de historia para probar el motor,
+              o sube tu propio histórico en CSV.
+            </p>
+          </Card>
+        </div>
+      ) : (
+        <div className="p-6">
+          {/* NAV */}
+          <div className="flex flex-wrap gap-2 mb-6">
+            <button
+              onClick={() => setView("salud")}
+              className="px-3 py-1.5 rounded-md text-sm font-medium border"
+              style={{
+                background: view === "salud" ? COLORS.accent : COLORS.panel,
+                color: view === "salud" ? "#fff" : COLORS.ink,
+                borderColor: view === "salud" ? COLORS.accent : COLORS.border,
+              }}
+            >
+              Salud del Portafolio
+            </button>
+            <button
+              onClick={() => setView("detalle")}
+              className="px-3 py-1.5 rounded-md text-sm font-medium border"
+              style={{
+                background: view === "detalle" ? COLORS.accent : COLORS.panel,
+                color: view === "detalle" ? "#fff" : COLORS.ink,
+                borderColor: view === "detalle" ? COLORS.accent : COLORS.border,
+              }}
+            >
+              Detalle SKU
+            </button>
+            <button
+              onClick={() => setView("resumen")}
+              className="px-3 py-1.5 rounded-md text-sm font-medium border"
+              style={{
+                background: view === "resumen" ? COLORS.accent : COLORS.panel,
+                color: view === "resumen" ? "#fff" : COLORS.ink,
+                borderColor: view === "resumen" ? COLORS.accent : COLORS.border,
+              }}
+            >
+              Resumen (todos los SKU)
+            </button>
+            <button
+              onClick={() => setView("limpieza")}
+              className="px-3 py-1.5 rounded-md text-sm font-medium border"
+              style={{
+                background: view === "limpieza" ? COLORS.accent : COLORS.panel,
+                color: view === "limpieza" ? "#fff" : COLORS.ink,
+                borderColor: view === "limpieza" ? COLORS.accent : COLORS.border,
+              }}
+            >
+              Calidad de Datos
+            </button>
+            <button
+              onClick={() => setView("abcxyz")}
+              className="px-3 py-1.5 rounded-md text-sm font-medium border"
+              style={{
+                background: view === "abcxyz" ? COLORS.accent : COLORS.panel,
+                color: view === "abcxyz" ? "#fff" : COLORS.ink,
+                borderColor: view === "abcxyz" ? COLORS.accent : COLORS.border,
+              }}
+            >
+              Segmentación ABC-XYZ
+            </button>
+            <button
+              onClick={() => setView("inventario")}
+              className="px-3 py-1.5 rounded-md text-sm font-medium border"
+              style={{
+                background: view === "inventario" ? COLORS.accent : COLORS.panel,
+                color: view === "inventario" ? "#fff" : COLORS.ink,
+                borderColor: view === "inventario" ? COLORS.accent : COLORS.border,
+              }}
+            >
+              Inventario Sugerido
+            </button>
+            <button
+              onClick={() => setView("fva")}
+              className="px-3 py-1.5 rounded-md text-sm font-medium border"
+              style={{
+                background: view === "fva" ? COLORS.accent : COLORS.panel,
+                color: view === "fva" ? "#fff" : COLORS.ink,
+                borderColor: view === "fva" ? COLORS.accent : COLORS.border,
+              }}
+            >
+              Ajuste & FVA
+            </button>
+            <button
+              onClick={() => setView("promo")}
+              className="px-3 py-1.5 rounded-md text-sm font-medium border"
+              style={{
+                background: view === "promo" ? COLORS.accent : COLORS.panel,
+                color: view === "promo" ? "#fff" : COLORS.ink,
+                borderColor: view === "promo" ? COLORS.accent : COLORS.border,
+              }}
+            >
+              Promociones
+            </button>
+            {branches && (
+              <button
+                onClick={() => setView("sucursales")}
+                className="px-3 py-1.5 rounded-md text-sm font-medium border"
+                style={{
+                  background: view === "sucursales" ? COLORS.accent : COLORS.panel,
+                  color: view === "sucursales" ? "#fff" : COLORS.ink,
+                  borderColor: view === "sucursales" ? COLORS.accent : COLORS.border,
+                }}
+              >
+                Top-Down Sucursal
+              </button>
+            )}
+          </div>
+
+          {/* VISTA GENERAL */}
+          {portfolio && (
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
+              <Card>
+                <Eyebrow>SKUs analizados</Eyebrow>
+                <div className="text-2xl font-semibold font-mono" style={{ color: COLORS.ink }}>{portfolio.count}</div>
+              </Card>
+              <Card>
+                <Eyebrow>Histórico últimos 12 meses (portafolio)</Eyebrow>
+                <div className="text-2xl font-semibold font-mono" style={{ color: COLORS.ink }}>{fmt(portfolio.last12)} u.</div>
+              </Card>
+              <Card>
+                <Eyebrow>Forecast portafolio · próximos {horizon} meses</Eyebrow>
+                <div className="text-2xl font-semibold font-mono" style={{ color: COLORS.accent }}>{fmt(portfolio.fcTotal)} u.</div>
+              </Card>
+            </div>
+          )}
+
+          {/* VISTA SALUD DEL PORTAFOLIO */}
+          {view === "salud" && healthScore && (
+            <div className="space-y-6">
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                {/* Gauge / score grande */}
+                <Card style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", textAlign: "center" }}>
+                  <Eyebrow>Score de salud</Eyebrow>
+                  <div className="relative my-2" style={{ width: 160, height: 160 }}>
+                    <svg width="160" height="160" viewBox="0 0 160 160">
+                      <circle cx="80" cy="80" r="68" fill="none" stroke={COLORS.grid} strokeWidth="14" />
+                      <circle cx="80" cy="80" r="68" fill="none" stroke={healthScore.grade.color} strokeWidth="14"
+                        strokelinecap="round" strokeDasharray={`${(healthScore.total / 100) * 427} 427`}
+                        transform="rotate(-90 80 80)" />
+                    </svg>
+                    <div className="absolute inset-0 flex flex-col items-center justify-center">
+                      <span className="text-4xl font-bold font-mono" style={{ color: healthScore.grade.color }}>{healthScore.total}</span>
+                      <span className="text-xs" style={{ color: COLORS.inkMuted }}>de 100</span>
+                    </div>
+                  </div>
+                  <span className="text-sm font-semibold px-3 py-1 rounded-full" style={{ background: healthScore.grade.color + "22", color: healthScore.grade.color }}>
+                    {healthScore.grade.label}
+                  </span>
+                </Card>
+
+                {/* Desglose del score */}
+                <Card style={{ gridColumn: "span 2" }}>
+                  <Eyebrow>Composición del score</Eyebrow>
+                  <div className="space-y-4 mt-3">
+                    {healthScore.breakdown.map((b) => (
+                      <div key={b.label}>
+                        <div className="flex justify-between text-sm mb-1">
+                          <span style={{ color: COLORS.ink }}>{b.label}</span>
+                          <span className="font-mono" style={{ color: COLORS.inkMuted }}>{b.score} / {b.max}</span>
+                        </div>
+                        <div className="w-full h-2.5 rounded-full" style={{ background: COLORS.grid }}>
+                          <div className="h-2.5 rounded-full" style={{ width: `${(b.score / b.max) * 100}%`, background: b.score / b.max > 0.75 ? COLORS.accent : b.score / b.max > 0.5 ? COLORS.amber : COLORS.brick }} />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  {healthScore.issues.length > 0 && (
+                    <div className="mt-5">
+                      <Eyebrow>Qué está restando puntos</Eyebrow>
+                      <div className="space-y-1.5 mt-2">
+                        {healthScore.issues.map((iss, i) => (
+                          <div key={i} className="flex items-center justify-between text-sm border-b pb-1.5" style={{ borderColor: COLORS.grid }}>
+                            <span style={{ color: COLORS.ink }}>↓ {iss.text}</span>
+                            {iss.pts > 0 && <span className="font-mono text-xs" style={{ color: COLORS.brick }}>−{iss.pts} pts</span>}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </Card>
+              </div>
+
+              {/* Tabla de cobertura / exceso / obsoleto */}
+              <Card>
+                <Eyebrow>Cobertura, exceso y obsolescencia</Eyebrow>
+                <p className="text-xs mb-3 mt-1" style={{ color: COLORS.inkMuted }}>
+                  Cobertura = stock actual ÷ demanda mensual promedio. Ingresa el stock actual en la pestaña Inventario para activar esta vista.
+                </p>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="text-left border-b" style={{ color: COLORS.inkMuted, borderColor: COLORS.border }}>
+                        <th className="py-2 pr-3 font-medium">SKU</th>
+                        <th className="py-2 pr-3 font-medium">Clase</th>
+                        <th className="py-2 pr-3 font-medium text-right">Stock actual</th>
+                        <th className="py-2 pr-3 font-medium text-right">Dem. prom.</th>
+                        <th className="py-2 pr-3 font-medium text-right">Cobertura (meses)</th>
+                        <th className="py-2 pr-3 font-medium">Estado</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {inventoryRows.map((r) => (
+                        <tr key={r.sku} className="border-b" style={{ borderColor: COLORS.grid }}>
+                          <td className="py-2 pr-3">
+                            <button onClick={() => { setSelectedSku(r.sku); setView("detalle"); }} className="text-left">
+                              <div className="font-semibold text-xs" style={{ color: COLORS.ink }}>{r.sku}</div>
+                              <div className="text-xs truncate max-w-[140px]" style={{ color: COLORS.inkMuted }}>{r.name}</div>
+                            </button>
+                          </td>
+                          <td className="py-2 pr-3"><span className="text-xs font-mono" style={{ color: COLORS.inkMuted }}>{r.cell}</span></td>
+                          <td className="py-2 pr-3 font-mono text-right">{r.cs != null ? fmt(r.cs) : "—"}</td>
+                          <td className="py-2 pr-3 font-mono text-right">{fmt(r.avgDemand, 1)}</td>
+                          <td className="py-2 pr-3 font-mono text-right" style={{ color: r.coverage.color }}>
+                            {r.coverage.months == null ? "—" : r.coverage.months >= 999 ? "∞" : r.coverage.months.toFixed(1)}
+                          </td>
+                          <td className="py-2 pr-3">
+                            <span className="text-xs font-semibold px-2 py-0.5 rounded-full" style={{ background: r.coverage.color + "22", color: r.coverage.color }}>
+                              {r.coverage.label}
+                            </span>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </Card>
+            </div>
+          )}
+
+          {/* VISTA DETALLE */}
+          {view === "detalle" && (
+          <div className="flex flex-col lg:flex-row gap-6">
+            {/* SIDEBAR SKUs */}
+            <div className="lg:w-64 flex-shrink-0 space-y-2">
+              <Eyebrow>skus</Eyebrow>
+              {Object.keys(skuData).map((sku) => {
+                const bt = analysis[sku];
+                const winnerLabel = MODEL_DEFS.find((m) => m.key === bt.winnerKey)?.label || "—";
+                const winnerErr = bt.results.find((r) => r.key === bt.winnerKey)?.wmape;
+                const active = sku === selectedSku;
+                return (
+                  <button
+                    key={sku}
+                    onClick={() => setSelectedSku(sku)}
+                    className="w-full text-left rounded-md border px-3 py-2"
+                    style={{ background: active ? COLORS.accentSoft : COLORS.panel, borderColor: active ? COLORS.accent : COLORS.border }}
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="font-semibold text-sm" style={{ color: COLORS.ink }}>{sku}</span>
+                      <span className="font-mono text-xs" style={{ color: COLORS.inkMuted }}>{fmtPct(winnerErr)}</span>
+                    </div>
+                    <div className="text-xs mt-0.5 truncate" style={{ color: COLORS.inkMuted }}>{skuData[sku].name}</div>
+                    <div className="text-xs mt-1 font-mono" style={{ color: COLORS.accent }}>{winnerLabel}</div>
+                    {lifecycle[sku] && (
+                      <div className="text-[10px] mt-1 inline-block px-1.5 py-0.5 rounded font-medium"
+                        style={{ background: LIFECYCLE[lifecycle[sku].stage].color + "1A", color: LIFECYCLE[lifecycle[sku].stage].color }}>
+                        {LIFECYCLE[lifecycle[sku].stage].icon} {LIFECYCLE[lifecycle[sku].stage].label}
+                      </div>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* CONTENIDO PRINCIPAL */}
+            <div className="flex-1 min-w-0 space-y-6">
+              {/* Controles */}
+              <div className="flex flex-wrap items-center justify-between gap-4">
+                <div>
+                  <h2 className="text-lg font-semibold" style={{ color: COLORS.ink }}>{currentSku}</h2>
+                  <div className="text-sm" style={{ color: COLORS.inkMuted }}>{skuData[currentSku].name}</div>
+                </div>
+                <div className="flex items-center gap-3">
+                  <div className="flex rounded-md border overflow-hidden" style={{ borderColor: COLORS.border }}>
+                    {[3, 6, 12, 18, 24].map((h) => (
+                      <button
+                        key={h}
+                        onClick={() => setHorizon(h)}
+                        className="px-3 py-1.5 text-sm font-mono"
+                        style={{
+                          background: horizon === h ? COLORS.accent : COLORS.panel,
+                          color: horizon === h ? "#fff" : COLORS.ink,
+                        }}
+                      >
+                        {h}m
+                      </button>
+                    ))}
+                  </div>
+                  <select
+                    value={usedModelKey}
+                    onChange={(e) => setModelOverrides((prev) => ({ ...prev, [currentSku]: e.target.value }))}
+                    className="text-sm border rounded-md px-2 py-1.5"
+                    style={{ borderColor: COLORS.border, color: COLORS.ink, background: COLORS.panel }}
+                  >
+                    {MODEL_DEFS.map((m) => {
+                      const row = currentBacktest.results.find((r) => r.key === m.key);
+                      if (!row || row.insufficient) return null;
+                      return <option key={m.key} value={m.key}>{m.label}{m.key === currentBacktest.winnerKey ? " ★" : ""}</option>;
+                    })}
+                  </select>
+                </div>
+              </div>
+
+              {/* KPIs del modelo usado */}
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                <Card>
+                  <Eyebrow>Modelo en uso</Eyebrow>
+                  <div className="text-base font-semibold" style={{ color: COLORS.ink }}>{MODEL_DEFS.find((m) => m.key === usedModelKey)?.label}</div>
+                  <div className="text-xs font-mono mt-1" style={{ color: COLORS.inkMuted }}>{finalFc?.paramsLabel}</div>
+                  {usedModelKey === currentBacktest.winnerKey && <div className="mt-2"><Stamp /></div>}
+                </Card>
+                <Card>
+                  <Eyebrow>Error histórico (backtest, {currentBacktest.holdout}m)</Eyebrow>
+                  <div className="text-2xl font-semibold font-mono" style={{ color: COLORS.ink }}>{fmtPct(usedResultRow?.wmape)}</div>
+                  <div className="text-xs mt-1" style={{ color: COLORS.inkMuted }}>WMAPE · RMSE {fmt(usedResultRow?.rmse, 1)}</div>
+                </Card>
+                <Card>
+                  <Eyebrow>Forecast total · {horizon} meses</Eyebrow>
+                  <div className="text-2xl font-semibold font-mono" style={{ color: COLORS.accent }}>{fmt(horizonTotal)} u.</div>
+                </Card>
+              </div>
+
+              {/* ALERTA DE CAMBIO ESTRUCTURAL */}
+              {structuralAlerts[currentSku]?.detected && (
+                <Card style={{ borderColor: COLORS.brick, borderWidth: 1.5, background: "#FDF4F1" }}>
+                  <div className="flex items-start gap-3">
+                    <div className="text-xl" style={{ lineHeight: 1 }}>⚠</div>
+                    <div className="flex-1">
+                      <Eyebrow>Posible cambio estructural detectado</Eyebrow>
+                      <p className="text-sm mt-1" style={{ color: COLORS.ink }}>
+                        {structuralAlerts[currentSku].label}.
+                        El promedio reciente ({structuralAlerts[currentSku].fromLabel}–{structuralAlerts[currentSku].toLabel}) es{" "}
+                        <strong>{fmt(structuralAlerts[currentSku].meanRecent)}</strong> u. vs.{" "}
+                        <strong>{fmt(structuralAlerts[currentSku].meanPrior)}</strong> u. histórico.
+                      </p>
+                      <p className="text-xs mt-2" style={{ color: COLORS.brick }}>
+                        El modelo estadístico asume que el pasado se repite. Si este cambio es real (nuevo cliente, cambio de precio, entrada/salida de competidor),
+                        considera revisar el forecast manualmente o reducir la ventana histórica usada.
+                      </p>
+                    </div>
+                  </div>
+                </Card>
+              )}
+
+              {/* PANEL CICLO DE VIDA */}
+              {lifecycle[currentSku] && (() => {
+                const lc = lifecycle[currentSku];
+                const info = LIFECYCLE[lc.stage];
+                const recoModel = recommendedModelForStage(lc.stage);
+                const recoLabel = recoModel ? MODEL_DEFS.find((m) => m.key === recoModel)?.label : null;
+                const usingReco = recoModel && usedModelKey === recoModel;
+                return (
+                  <Card style={{ borderLeftWidth: 4, borderLeftColor: info.color }}>
+                    <div className="flex items-start justify-between flex-wrap gap-3">
+                      <div className="flex-1">
+                        <Eyebrow>Etapa del ciclo de vida</Eyebrow>
+                        <div className="flex items-center gap-2 mt-1">
+                          <span className="text-lg">{info.icon}</span>
+                          <span className="text-base font-semibold" style={{ color: info.color }}>{info.label}</span>
+                          <span className="text-xs px-1.5 py-0.5 rounded-full" style={{ background: COLORS.panelAlt, color: COLORS.inkMuted }}>
+                            confianza {lc.confidence}
+                          </span>
+                        </div>
+                        <p className="text-sm mt-1.5" style={{ color: COLORS.inkMuted }}>{info.desc}</p>
+                      </div>
+                      {recoModel && recoLabel && (
+                        <div className="text-right">
+                          <Eyebrow>Modelo sugerido</Eyebrow>
+                          <div className="text-sm font-medium mt-1" style={{ color: COLORS.ink }}>{recoLabel}</div>
+                          {usingReco ? (
+                            <span className="text-xs" style={{ color: COLORS.accent }}>✓ En uso</span>
+                          ) : (
+                            <button
+                              onClick={() => setModelOverrides((prev) => ({ ...prev, [currentSku]: recoModel }))}
+                              className="mt-1 text-xs px-2 py-1 rounded-md border"
+                              style={{ borderColor: COLORS.accent, color: COLORS.accent }}>
+                              Aplicar este modelo
+                            </button>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </Card>
+                );
+              })()}
+
+              {/* PANEL CALIDAD DE DATOS */}
+              {currentOutliers.length > 0 && (
+                <Card style={{ borderColor: currentClean ? COLORS.accent : COLORS.amber, borderWidth: 1.5 }}>
+                  <div className="flex items-center justify-between flex-wrap gap-3">
+                    <div>
+                      <Eyebrow>Calidad de datos · {currentOutliers.length} anomalía{currentOutliers.length > 1 ? "s" : ""} detectada{currentOutliers.length > 1 ? "s" : ""}</Eyebrow>
+                      <div className="flex flex-wrap gap-2 mt-2">
+                        {currentOutliers.map((f, i) => (
+                          <span key={i} className="text-xs px-2 py-0.5 rounded-full font-mono"
+                            style={{ background: f.type === "stockout" ? COLORS.amberSoft : "#FEE2E2", color: f.type === "stockout" ? COLORS.amber : COLORS.brick }}>
+                            {currentDates[f.index] ? monthLabel(currentDates[f.index]) : `idx ${f.index}`} · {f.label}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                    <label className="flex items-center gap-2 cursor-pointer select-none">
+                      <div className="relative">
+                        <input type="checkbox" className="sr-only" checked={currentClean}
+                          onChange={(e) => setUseCleanData((prev) => ({ ...prev, [currentSku]: e.target.checked }))} />
+                        <div className="w-10 h-5 rounded-full transition-colors" style={{ background: currentClean ? COLORS.accent : COLORS.border }} />
+                        <div className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white transition-transform" style={{ transform: currentClean ? "translateX(20px)" : "translateX(0)" }} />
+                      </div>
+                      <span className="text-sm font-medium" style={{ color: COLORS.ink }}>Usar datos limpios</span>
+                    </label>
+                  </div>
+                  {currentClean && (
+                    <p className="text-xs mt-2" style={{ color: COLORS.accent }}>
+                      ✓ El modelo está entrenando con valores interpolados en los puntos anómalos.
+                    </p>
+                  )}
+                </Card>
+              )}
+
+              {/* GRÁFICO */}
+              <Card>
+                <div className="flex items-center justify-between flex-wrap gap-2">
+                  <Eyebrow>Histórico, ajuste del modelo y proyección</Eyebrow>
+                  {currentSigma != null && (
+                    <span className="text-xs px-2 py-0.5 rounded-full font-mono" style={{ background: COLORS.accentSoft, color: COLORS.accent }}>
+                      banda = intervalo 90% de confianza
+                    </span>
+                  )}
+                </div>
+                <ResponsiveContainer width="100%" height={340}>
+                  <ComposedChart data={chartData} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
+                    <CartesianGrid stroke={COLORS.grid} vertical={false} />
+                    <XAxis dataKey="month" tick={{ fontSize: 11, fill: COLORS.inkMuted }} interval={Math.max(0, Math.floor(chartData.length / 14))} />
+                    <YAxis tick={{ fontSize: 11, fill: COLORS.inkMuted }} width={40} />
+                    <Tooltip contentStyle={{ fontSize: 12, borderRadius: 6, borderColor: COLORS.border }}
+                      formatter={(value, name) => {
+                        if (name === "low" || name === "band") return [null, null];
+                        return [fmt(value, 0), name];
+                      }} />
+                    <ReferenceLine
+                      x={monthLabel(currentDates[currentDates.length - 1])}
+                      stroke={COLORS.amber}
+                      strokeDasharray="3 3"
+                      label={{ value: "Hoy", position: "insideTopRight", fontSize: 11, fill: COLORS.amber }}
+                    />
+                    {/* Banda de confianza: base invisible + altura coloreada */}
+                    <Area type="monotone" dataKey="low" stackId="ci" stroke="none" fill="transparent" legendType="none" connectNulls={false} isAnimationActive={false} />
+                    <Area type="monotone" dataKey="band" stackId="ci" stroke="none" fill={COLORS.accent} fillOpacity={0.12} name="Rango 90%" connectNulls={false} isAnimationActive={false} />
+                    <Line type="monotone" dataKey="real" name="Histórico real" stroke={COLORS.graphite} strokeWidth={2} dot={false} connectNulls={false} />
+                    <Line type="monotone" dataKey="ajuste" name="Ajuste del modelo" stroke={COLORS.accent} strokeWidth={1.5} strokeDasharray="3 3" dot={false} connectNulls={false} />
+                    <Line type="monotone" dataKey="forecast" name="Forecast" stroke={COLORS.accent} strokeWidth={2.5} dot={{ r: 3 }} connectNulls={false} />
+                    <Legend wrapperStyle={{ fontSize: 12 }} />
+                  </ComposedChart>
+                </ResponsiveContainer>
+              </Card>
+
+              {/* TABLA COMPARATIVA DE MODELOS */}
+              <Card>
+                <Eyebrow>Comparación de modelos (backtest de los últimos {currentBacktest.holdout} meses)</Eyebrow>
+                <div className="overflow-x-auto mt-2">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr style={{ color: COLORS.inkMuted }} className="text-left border-b" >
+                        <th className="py-2 pr-3 font-medium" style={{ borderColor: COLORS.border }}>Modelo</th>
+                        <th className="py-2 pr-3 font-medium">Parámetros</th>
+                        <th className="py-2 pr-3 font-medium">WMAPE</th>
+                        <th className="py-2 pr-3 font-medium">RMSE</th>
+                        <th className="py-2 pr-3 font-medium">Sesgo</th>
+                        <th className="py-2 pr-3 font-medium"></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {sortedResults.map((r) => {
+                        const isWinner = r.key === currentBacktest.winnerKey;
+                        const isUsed = r.key === usedModelKey;
+                        return (
+                          <tr key={r.key} className="border-b" style={{ borderColor: COLORS.grid, background: isUsed ? COLORS.accentSoft : "transparent" }}>
+                            <td className="py-2 pr-3" style={{ color: COLORS.ink }}>
+                              <div className="flex items-center gap-2">
+                                {isWinner && <CheckCircle2 size={14} style={{ color: COLORS.accent }} />}
+                                {r.label}
+                              </div>
+                            </td>
+                            {r.insufficient ? (
+                              <td colSpan={4} className="py-2 pr-3 text-xs" style={{ color: COLORS.inkMuted }}>historia insuficiente para este modelo</td>
+                            ) : (
+                              <>
+                                <td className="py-2 pr-3 font-mono text-xs" style={{ color: COLORS.inkMuted }}>{r.paramsLabel}</td>
+                                <td className="py-2 pr-3 font-mono">{fmtPct(r.wmape)}</td>
+                                <td className="py-2 pr-3 font-mono">{fmt(r.rmse, 1)}</td>
+                                <td className="py-2 pr-3 font-mono">{fmt(r.bias, 1)}</td>
+                              </>
+                            )}
+                            <td className="py-2 pr-3">
+                              {!r.insufficient && !isUsed && (
+                                <button
+                                  onClick={() => {
+                                    setModelOverrides((prev) => ({ ...prev, [currentSku]: r.key }));
+                                    setBacktestView((prev) => ({ ...prev, [currentSku]: r.key }));
+                                  }}
+                                  className="text-xs px-2 py-1 rounded-md border"
+                                  style={{ borderColor: COLORS.border, color: COLORS.ink }}
+                                >
+                                  Usar este modelo
+                                </button>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </Card>
+
+              {/* PANEL DE BACKTEST / SIMULACIÓN VS HISTORIA */}
+              <Card>
+                <div className="flex items-center justify-between flex-wrap gap-3">
+                  <Eyebrow>Simular contra historia pasada</Eyebrow>
+                  <select
+                    value={backtestKey}
+                    onChange={(e) => setBacktestView((prev) => ({ ...prev, [currentSku]: e.target.value }))}
+                    className="text-xs border rounded-md px-2 py-1"
+                    style={{ borderColor: COLORS.border, color: COLORS.ink, background: COLORS.panel }}
+                  >
+                    {MODEL_DEFS.map((m) => {
+                      const row = currentBacktest.results.find((r) => r.key === m.key);
+                      if (!row || row.insufficient) return null;
+                      return <option key={m.key} value={m.key}>{m.label}</option>;
+                    })}
+                  </select>
+                </div>
+                <p className="text-xs mt-2" style={{ color: COLORS.inkMuted }}>
+                  Estos son los últimos {currentBacktest.holdout} meses que el modelo no vio durante el ajuste; así medimos qué tan bien habría predicho el pasado reciente.
+                </p>
+                {backtestRow && backtestDates && (
+                  <div className="overflow-x-auto mt-3">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="text-left border-b" style={{ color: COLORS.inkMuted, borderColor: COLORS.border }}>
+                          <th className="py-1.5 pr-3 font-medium">Mes</th>
+                          <th className="py-1.5 pr-3 font-medium">Real</th>
+                          <th className="py-1.5 pr-3 font-medium">Predicho</th>
+                          <th className="py-1.5 pr-3 font-medium">Error</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {backtestDates.map((d, i) => {
+                          const real = currentBacktest.test[i];
+                          const pred = backtestRow.preds ? Math.round(backtestRow.preds[i] * 10) / 10 : null;
+                          const err = pred != null ? real - pred : null;
+                          return (
+                            <tr key={i} className="border-b" style={{ borderColor: COLORS.grid }}>
+                              <td className="py-1.5 pr-3" style={{ color: COLORS.ink }}>{monthLabel(d)}</td>
+                              <td className="py-1.5 pr-3 font-mono">{fmt(real)}</td>
+                              <td className="py-1.5 pr-3 font-mono">{fmt(pred, 1)}</td>
+                              <td className="py-1.5 pr-3 font-mono" style={{ color: err != null && Math.abs(err) > 0 ? COLORS.brick : COLORS.inkMuted }}>
+                                {err == null ? "—" : `${err >= 0 ? "+" : ""}${fmt(err, 1)}`}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </Card>
+
+            </div>
+          </div>
+          )}
+
+          {view === "resumen" && summaryRows && (
+            <>
+            <Card style={{ marginBottom: 24 }}>
+              <div className="flex items-center justify-between flex-wrap gap-3 mb-2">
+                <Eyebrow>Ventas históricas + demanda proyectada</Eyebrow>
+                <div className="flex items-center gap-2">
+                  <select
+                    value={chartSku}
+                    onChange={(e) => setChartSku(e.target.value)}
+                    className="text-sm border rounded-md px-2 py-1.5"
+                    style={{ borderColor: COLORS.border, color: COLORS.ink, background: COLORS.panel }}
+                  >
+                    <option value="TOTAL">Total (todos los SKU)</option>
+                    {Object.keys(skuData).map((sku) => (
+                      <option key={sku} value={sku}>{sku}</option>
+                    ))}
+                  </select>
+                  <div className="flex rounded-md border overflow-hidden" style={{ borderColor: COLORS.border }}>
+                    {[{ k: "line", l: "Líneas" }, { k: "bar", l: "Barras" }].map((t) => (
+                      <button
+                        key={t.k}
+                        onClick={() => setChartType(t.k)}
+                        className="px-3 py-1.5 text-sm"
+                        style={{ background: chartType === t.k ? COLORS.accent : COLORS.panel, color: chartType === t.k ? "#fff" : COLORS.ink }}
+                      >
+                        {t.l}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+              <ResponsiveContainer width="100%" height={340}>
+                {chartType === "line" ? (
+                  <LineChart data={aggChartData} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
+                    <CartesianGrid stroke={COLORS.grid} vertical={false} />
+                    <XAxis dataKey="month" tick={{ fontSize: 11, fill: COLORS.inkMuted }} interval={Math.max(0, Math.floor(aggChartData.length / 14))} />
+                    <YAxis tick={{ fontSize: 11, fill: COLORS.inkMuted }} width={48} />
+                    <Tooltip contentStyle={{ fontSize: 12, borderRadius: 6, borderColor: COLORS.border }} />
+                    {aggregateSeries.historyPoints.length > 0 && (
+                      <ReferenceLine
+                        x={monthLabel(aggregateSeries.historyPoints[aggregateSeries.historyPoints.length - 1].date)}
+                        stroke={COLORS.amber}
+                        strokeDasharray="3 3"
+                        label={{ value: "Hoy", position: "insideTopRight", fontSize: 11, fill: COLORS.amber }}
+                      />
+                    )}
+                    <Line type="monotone" dataKey="real" name="Ventas históricas" stroke={COLORS.graphite} strokeWidth={2} dot={false} connectNulls={false} />
+                    <Line type="monotone" dataKey="forecast" name="Demanda proyectada" stroke={COLORS.accent} strokeWidth={2.5} dot={{ r: 3 }} connectNulls={false} />
+                    <Legend wrapperStyle={{ fontSize: 12 }} />
+                  </LineChart>
+                ) : (
+                  <BarChart data={aggChartData} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
+                    <CartesianGrid stroke={COLORS.grid} vertical={false} />
+                    <XAxis dataKey="month" tick={{ fontSize: 11, fill: COLORS.inkMuted }} interval={Math.max(0, Math.floor(aggChartData.length / 14))} />
+                    <YAxis tick={{ fontSize: 11, fill: COLORS.inkMuted }} width={48} />
+                    <Tooltip contentStyle={{ fontSize: 12, borderRadius: 6, borderColor: COLORS.border }} />
+                    {aggregateSeries.historyPoints.length > 0 && (
+                      <ReferenceLine
+                        x={monthLabel(aggregateSeries.historyPoints[aggregateSeries.historyPoints.length - 1].date)}
+                        stroke={COLORS.amber}
+                        strokeDasharray="3 3"
+                        label={{ value: "Hoy", position: "insideTopRight", fontSize: 11, fill: COLORS.amber }}
+                      />
+                    )}
+                    <Bar dataKey="real" name="Ventas históricas" fill={COLORS.graphite} radius={[2, 2, 0, 0]} />
+                    <Bar dataKey="forecast" name="Demanda proyectada" fill={COLORS.accent} radius={[2, 2, 0, 0]} />
+                    <Legend wrapperStyle={{ fontSize: 12 }} />
+                  </BarChart>
+                )}
+              </ResponsiveContainer>
+            </Card>
+
+            <Card>
+              <div className="flex items-center justify-between flex-wrap gap-3 mb-2">
+                <Eyebrow>Forecast por SKU · próximos {horizon} meses</Eyebrow>
+                <button
+                  onClick={exportSummaryCsv}
+                  className="flex items-center gap-2 px-3 py-1.5 rounded-md text-xs font-medium border"
+                  style={{ borderColor: COLORS.border, color: COLORS.ink }}
+                >
+                  <Download size={14} /> Exportar CSV
+                </button>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-left border-b" style={{ color: COLORS.inkMuted, borderColor: COLORS.border }}>
+                      <th className="py-2 pr-3 font-medium">SKU</th>
+                      <th className="py-2 pr-3 font-medium">Ciclo</th>
+                      <th className="py-2 pr-3 font-medium">Modelo</th>
+                      <th className="py-2 pr-3 font-medium">Error</th>
+                      <th className="py-2 pr-3 font-medium text-right">Hist. 12m</th>
+                      {futureMonthLabels.map((lbl) => (
+                        <th key={lbl} className="py-2 pr-3 font-medium text-right font-mono">{lbl}</th>
+                      ))}
+                      <th className="py-2 pr-3 font-medium text-right">Total horiz.</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {summaryRows.map((row) => (
+                      <tr key={row.sku} className="border-b" style={{ borderColor: COLORS.grid }}>
+                        <td className="py-2 pr-3">
+                          <button onClick={() => { setSelectedSku(row.sku); setView("detalle"); }} className="text-left">
+                            <div className="font-semibold" style={{ color: COLORS.ink }}>{row.sku}</div>
+                            <div className="text-xs" style={{ color: COLORS.inkMuted }}>{row.name}</div>
+                          </button>
+                        </td>
+                        <td className="py-2 pr-3">
+                          {lifecycle[row.sku] && (
+                            <span className="text-xs px-1.5 py-0.5 rounded font-medium whitespace-nowrap"
+                              style={{ background: LIFECYCLE[lifecycle[row.sku].stage].color + "1A", color: LIFECYCLE[lifecycle[row.sku].stage].color }}>
+                              {LIFECYCLE[lifecycle[row.sku].stage].icon} {LIFECYCLE[lifecycle[row.sku].stage].label}
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-2 pr-3 text-xs font-mono" style={{ color: row.isWinner ? COLORS.accent : COLORS.inkMuted }}>
+                          {row.modelLabel}{row.isWinner ? " ★" : ""}
+                        </td>
+                        <td className="py-2 pr-3 font-mono">{fmtPct(row.wmape)}</td>
+                        <td className="py-2 pr-3 font-mono text-right">{fmt(row.last12)}</td>
+                        {row.monthly.map((v, i) => (
+                          <td key={i} className="py-2 pr-3 font-mono text-right">{fmt(v, 1)}</td>
+                        ))}
+                        <td className="py-2 pr-3 font-mono text-right font-semibold" style={{ color: COLORS.accent }}>{fmt(row.total, 1)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </Card>
+            </>
+          )}
+
+          <p className="text-xs mt-6" style={{ color: COLORS.inkMuted }}>
+            Forecast a nivel SKU con desagregación top-down por sucursal, intervalos de confianza, ciclo de vida y gestión de promociones.
+          </p>
+
+          {/* VISTA CALIDAD DE DATOS */}
+          {view === "limpieza" && (
+            <Card>
+              <Eyebrow>Diagnóstico de calidad por SKU</Eyebrow>
+              <p className="text-xs mb-4 mt-1" style={{ color: COLORS.inkMuted }}>
+                Detección automática basada en IQR (picos/valles estadísticos) y secuencias de ceros (posibles quiebres de stock).
+                Activa "datos limpios" para que el modelo excluya esas anomalías del entrenamiento.
+              </p>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-left border-b" style={{ color: COLORS.inkMuted, borderColor: COLORS.border }}>
+                      <th className="py-2 pr-4 font-medium">SKU</th>
+                      <th className="py-2 pr-4 font-medium">Anomalías</th>
+                      <th className="py-2 pr-4 font-medium">Detalle</th>
+                      <th className="py-2 pr-4 font-medium">Datos limpios</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {Object.keys(skuData).map((sku) => {
+                      const outliers = allOutliers[sku] || [];
+                      const clean = !!useCleanData[sku];
+                      return (
+                        <tr key={sku} className="border-b" style={{ borderColor: COLORS.grid }}>
+                          <td className="py-3 pr-4">
+                            <div className="font-semibold" style={{ color: COLORS.ink }}>{sku}</div>
+                            <div className="text-xs" style={{ color: COLORS.inkMuted }}>{skuData[sku].name}</div>
+                          </td>
+                          <td className="py-3 pr-4">
+                            {outliers.length === 0 ? (
+                              <span className="text-xs px-2 py-0.5 rounded-full font-mono" style={{ background: COLORS.accentSoft, color: COLORS.accent }}>✓ Sin anomalías</span>
+                            ) : (
+                              <span className="text-xs px-2 py-0.5 rounded-full font-mono" style={{ background: COLORS.amberSoft, color: COLORS.amber }}>{outliers.length} anomalía{outliers.length > 1 ? "s" : ""}</span>
+                            )}
+                          </td>
+                          <td className="py-3 pr-4">
+                            <div className="flex flex-wrap gap-1">
+                              {outliers.map((f, i) => (
+                                <span key={i} className="text-xs px-2 py-0.5 rounded-full font-mono" style={{ background: f.type === "stockout" ? COLORS.amberSoft : "#FEE2E2", color: f.type === "stockout" ? COLORS.amber : COLORS.brick }}>
+                                  {skuData[sku].dates[f.index] ? monthLabel(skuData[sku].dates[f.index]) : `#${f.index}`}: {f.label}
+                                </span>
+                              ))}
+                              {outliers.length === 0 && <span className="text-xs" style={{ color: COLORS.inkMuted }}>—</span>}
+                            </div>
+                          </td>
+                          <td className="py-3 pr-4">
+                            {outliers.length > 0 ? (
+                              <label className="flex items-center gap-2 cursor-pointer select-none">
+                                <div className="relative">
+                                  <input type="checkbox" className="sr-only" checked={clean}
+                                    onChange={(e) => setUseCleanData((prev) => ({ ...prev, [sku]: e.target.checked }))} />
+                                  <div className="w-9 h-5 rounded-full transition-colors" style={{ background: clean ? COLORS.accent : COLORS.border }} />
+                                  <div className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white transition-transform" style={{ transform: clean ? "translateX(16px)" : "translateX(0)" }} />
+                                </div>
+                                <span className="text-xs" style={{ color: clean ? COLORS.accent : COLORS.inkMuted }}>{clean ? "Activo" : "Inactivo"}</span>
+                              </label>
+                            ) : <span className="text-xs" style={{ color: COLORS.inkMuted }}>—</span>}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </Card>
+          )}
+
+          {/* VISTA INVENTARIO */}
+          {view === "inventario" && inventoryRows && (
+            <div className="space-y-6">
+              {/* PARÁMETROS GLOBALES */}
+              <Card>
+                <Eyebrow>Parámetros globales de inventario</Eyebrow>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mt-3">
+                  <div>
+                    <label className="text-xs font-medium block mb-1" style={{ color: COLORS.inkMuted }}>Lead Time global (meses)</label>
+                    <input type="number" min="0.5" max="24" step="0.5" value={globalLT}
+                      onChange={(e) => setGlobalLT(Number(e.target.value))}
+                      className="w-full border rounded-md px-2 py-1.5 text-sm font-mono"
+                      style={{ borderColor: COLORS.border, color: COLORS.ink }} />
+                  </div>
+                  <div>
+                    <label className="text-xs font-medium block mb-1" style={{ color: COLORS.inkMuted }}>Nivel de servicio global</label>
+                    <select value={globalSL} onChange={(e) => setGlobalSL(Number(e.target.value))}
+                      className="w-full border rounded-md px-2 py-1.5 text-sm"
+                      style={{ borderColor: COLORS.border, color: COLORS.ink, background: COLORS.panel }}
+                      disabled={useAbcSL}>
+                      {[80, 85, 90, 95, 98, 99, 99.5].map((v) => <option key={v} value={v}>{v}%</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs font-medium block mb-1" style={{ color: COLORS.inkMuted }}>Período de revisión (meses)</label>
+                    <input type="number" min="0.5" max="6" step="0.5" value={globalReview}
+                      onChange={(e) => setGlobalReview(Number(e.target.value))}
+                      className="w-full border rounded-md px-2 py-1.5 text-sm font-mono"
+                      style={{ borderColor: COLORS.border, color: COLORS.ink }} />
+                  </div>
+                  <div className="flex flex-col justify-end">
+                    <label className="flex items-center gap-2 cursor-pointer select-none mt-auto pb-1.5">
+                      <div className="relative">
+                        <input type="checkbox" className="sr-only" checked={useAbcSL}
+                          onChange={(e) => setUseAbcSL(e.target.checked)} />
+                        <div className="w-9 h-5 rounded-full transition-colors" style={{ background: useAbcSL ? COLORS.accent : COLORS.border }} />
+                        <div className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white transition-transform" style={{ transform: useAbcSL ? "translateX(16px)" : "translateX(0)" }} />
+                      </div>
+                      <span className="text-xs font-medium" style={{ color: COLORS.ink }}>NS por clase ABC</span>
+                    </label>
+                    {useAbcSL && (
+                      <div className="text-xs font-mono mt-1 space-y-0.5">
+                        {["A", "B", "C"].map((c) => (
+                          <span key={c} className="block" style={{ color: COLORS.inkMuted }}>
+                            {c} → {SL_BY_ABC[c]}%
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </Card>
+
+              {/* KPIs RESUMEN */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                {[
+                  { label: "Stock de seguridad total", value: fmt(inventoryRows.reduce((a, r) => a + r.ss, 0)) + " u." },
+                  { label: "Punto de reorden total", value: fmt(inventoryRows.reduce((a, r) => a + r.rop, 0)) + " u." },
+                  { label: "Stock máximo total", value: fmt(inventoryRows.reduce((a, r) => a + r.maxStock, 0)) + " u." },
+                  {
+                    label: "Orden sugerida total",
+                    value: inventoryRows.some((r) => r.suggestedOrder != null)
+                      ? fmt(inventoryRows.reduce((a, r) => a + (r.suggestedOrder || 0), 0)) + " u."
+                      : "Ingresa stock actual",
+                  },
+                ].map((k) => (
+                  <Card key={k.label}>
+                    <Eyebrow>{k.label}</Eyebrow>
+                    <div className="text-xl font-semibold font-mono mt-1" style={{ color: COLORS.accent }}>{k.value}</div>
+                  </Card>
+                ))}
+              </div>
+
+              {/* TABLA POR SKU */}
+              <Card>
+                <div className="flex items-center justify-between flex-wrap gap-3 mb-3">
+                  <Eyebrow>Parámetros por SKU</Eyebrow>
+                  <button
+                    onClick={() => {
+                      const header = ["SKU", "Nombre", "Clase", "Lead Time", "Nivel Servicio", "Demanda Prom/mes", "Desv Std", "Stock Seguridad", "Punto Reorden", "Stock Máximo", "Stock Actual", "Orden Sugerida"];
+                      const lines = [header.join(",")];
+                      for (const r of inventoryRows) {
+                        lines.push([r.sku, `"${r.name}"`, r.cell, r.lt, `${r.sl}%`, fmt(r.avgDemand, 1), fmt(r.stdDev, 1), r.ss, r.rop, r.maxStock, r.cs ?? "", r.suggestedOrder ?? ""].join(","));
+                      }
+                      const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8;" });
+                      const url = URL.createObjectURL(blob);
+                      const a = document.createElement("a");
+                      a.href = url; a.download = "inventario_sugerido.csv"; a.click();
+                      URL.revokeObjectURL(url);
+                    }}
+                    className="flex items-center gap-2 px-3 py-1.5 rounded-md text-xs font-medium border"
+                    style={{ borderColor: COLORS.border, color: COLORS.ink }}
+                  >
+                    <Download size={14} /> Exportar CSV
+                  </button>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="text-left border-b" style={{ color: COLORS.inkMuted, borderColor: COLORS.border }}>
+                        <th className="py-2 pr-3 font-medium">SKU</th>
+                        <th className="py-2 pr-3 font-medium">Clase</th>
+                        <th className="py-2 pr-3 font-medium">LT</th>
+                        <th className="py-2 pr-3 font-medium">NS</th>
+                        <th className="py-2 pr-3 font-medium text-right">Dem. prom.</th>
+                        <th className="py-2 pr-3 font-medium text-right">σ demanda</th>
+                        <th className="py-2 pr-3 font-medium text-right" style={{ color: COLORS.accent }}>SS</th>
+                        <th className="py-2 pr-3 font-medium text-right" style={{ color: COLORS.amber }}>ROP</th>
+                        <th className="py-2 pr-3 font-medium text-right">Stock máx.</th>
+                        <th className="py-2 pr-3 font-medium text-right">Stock actual</th>
+                        <th className="py-2 pr-3 font-medium text-right">Cob. (m)</th>
+                        <th className="py-2 pr-3 font-medium text-right">Orden sug.</th>
+                        <th className="py-2 pr-3 font-medium">Estado</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {inventoryRows.map((r) => {
+                        const strat = ABC_XYZ_STRATEGIES[r.cell] || {};
+                        const statusColor = r.cs == null ? COLORS.inkMuted
+                          : r.cs < r.ss ? COLORS.brick
+                          : r.cs < r.rop ? COLORS.amber
+                          : COLORS.accent;
+                        const statusLabel = r.cs == null ? "—"
+                          : r.cs < r.ss ? "⚠ Bajo SS"
+                          : r.cs < r.rop ? "↓ Bajo ROP"
+                          : r.cs > r.maxStock ? "↑ Exceso"
+                          : "✓ OK";
+                        return (
+                          <tr key={r.sku} className="border-b" style={{ borderColor: COLORS.grid }}>
+                            <td className="py-2 pr-3">
+                              <button onClick={() => { setSelectedSku(r.sku); setView("detalle"); }} className="text-left">
+                                <div className="font-semibold text-xs" style={{ color: COLORS.ink }}>{r.sku}</div>
+                                <div className="text-xs truncate max-w-[110px]" style={{ color: COLORS.inkMuted }}>{r.name}</div>
+                              </button>
+                            </td>
+                            <td className="py-2 pr-3">
+                              <span className="text-xs font-bold font-mono px-1.5 py-0.5 rounded" style={{ background: (strat.color || COLORS.inkMuted) + "22", color: strat.color || COLORS.inkMuted }}>{r.cell}</span>
+                            </td>
+                            <td className="py-2 pr-3">
+                              <input type="number" min="0.5" max="24" step="0.5" value={ltOverrides[r.sku] ?? r.lt}
+                                onChange={(e) => setLtOverrides((prev) => ({ ...prev, [r.sku]: Number(e.target.value) }))}
+                                className="w-14 border rounded px-1 py-0.5 text-xs font-mono text-center"
+                                style={{ borderColor: COLORS.border }} />
+                            </td>
+                            <td className="py-2 pr-3 font-mono text-xs">{r.sl}%</td>
+                            <td className="py-2 pr-3 font-mono text-right">{fmt(r.avgDemand, 1)}</td>
+                            <td className="py-2 pr-3 font-mono text-right">{fmt(r.stdDev, 1)}</td>
+                            <td className="py-2 pr-3 font-mono text-right font-semibold" style={{ color: COLORS.accent }}>{fmt(r.ss)}</td>
+                            <td className="py-2 pr-3 font-mono text-right font-semibold" style={{ color: COLORS.amber }}>{fmt(r.rop)}</td>
+                            <td className="py-2 pr-3 font-mono text-right">{fmt(r.maxStock)}</td>
+                            <td className="py-2 pr-3">
+                              <input type="number" min="0" placeholder="—"
+                                value={currentStock[r.sku] ?? ""}
+                                onChange={(e) => setCurrentStock((prev) => ({ ...prev, [r.sku]: e.target.value === "" ? null : Number(e.target.value) }))}
+                                className="w-20 border rounded px-1 py-0.5 text-xs font-mono text-right"
+                                style={{ borderColor: r.cs != null && r.cs < r.rop ? COLORS.amber : COLORS.border }} />
+                            </td>
+                            <td className="py-2 pr-3 font-mono text-right text-xs">{r.stockMonths ?? "—"}</td>
+                            <td className="py-2 pr-3 font-mono text-right font-semibold"
+                              style={{ color: r.suggestedOrder != null && r.suggestedOrder > 0 ? COLORS.brick : COLORS.inkMuted }}>
+                              {r.suggestedOrder != null ? (r.suggestedOrder > 0 ? fmt(r.suggestedOrder) : "—") : "—"}
+                            </td>
+                            <td className="py-2 pr-3 text-xs font-semibold" style={{ color: statusColor }}>{statusLabel}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+                <p className="text-xs mt-3" style={{ color: COLORS.inkMuted }}>
+                  SS = Stock de Seguridad · ROP = Punto de Reorden · LT = Lead Time (editable por fila) · Ingresa el stock actual para ver la orden sugerida y el estado.
+                  Fórmula: SS = Z(NS) × σ × √(LT) · ROP = Dem.prom × LT + SS · Stock máx = Dem.prom × (LT + Rev.) + SS
+                </p>
+              </Card>
+            </div>
+          )}
+          {view === "abcxyz" && abcxyz && (
+            <div className="space-y-6">
+              {/* MATRIZ */}
+              <Card>
+                <Eyebrow>Matriz ABC-XYZ</Eyebrow>
+                <p className="text-xs mb-4 mt-1" style={{ color: COLORS.inkMuted }}>
+                  ABC = valor acumulado de venta (A: top 80%, B: 80-95%, C: 95-100%) ·
+                  XYZ = variabilidad (X: CV&lt;0.5, Y: CV 0.5-1.0, Z: CV&gt;1.0)
+                </p>
+                <div className="overflow-x-auto">
+                  <table className="border-collapse" style={{ width: "100%" }}>
+                    <thead>
+                      <tr>
+                        <th className="p-2 text-xs font-mono" style={{ color: COLORS.inkMuted }} />
+                        {["X (estable)", "Y (variable)", "Z (errática)"].map((h) => (
+                          <th key={h} className="p-3 text-center text-xs font-medium" style={{ color: COLORS.ink, background: COLORS.panelAlt, border: `1px solid ${COLORS.border}` }}>{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {["A", "B", "C"].map((abc) => (
+                        <tr key={abc}>
+                          <td className="p-3 text-xs font-semibold text-center" style={{ background: COLORS.panelAlt, border: `1px solid ${COLORS.border}`, color: COLORS.ink }}>
+                            {abc === "A" ? "A (crítico)" : abc === "B" ? "B (medio)" : "C (bajo valor)"}
+                          </td>
+                          {["X", "Y", "Z"].map((xyz) => {
+                            const cell = abc + xyz;
+                            const strat = ABC_XYZ_STRATEGIES[cell];
+                            const cellSkus = Object.keys(abcxyz).filter((s) => abcxyz[s].cell === cell);
+                            return (
+                              <td key={xyz} className="p-3 align-top" style={{ border: `1px solid ${COLORS.border}`, background: cellSkus.length > 0 ? "#FAFAF8" : COLORS.panelAlt, minWidth: 160 }}>
+                                <div className="text-xs font-bold mb-1" style={{ color: strat.color }}>{cell}</div>
+                                <div className="text-xs mb-2" style={{ color: COLORS.inkMuted }}>{strat.desc}</div>
+                                <div className="flex flex-wrap gap-1">
+                                  {cellSkus.map((s) => (
+                                    <span key={s} onClick={() => { setSelectedSku(s); setView("detalle"); }}
+                                      className="text-xs px-1.5 py-0.5 rounded cursor-pointer font-mono"
+                                      style={{ background: strat.color + "22", color: strat.color, border: `1px solid ${strat.color}44` }}>
+                                      {s}
+                                    </span>
+                                  ))}
+                                  {cellSkus.length === 0 && <span className="text-xs" style={{ color: COLORS.inkMuted }}>—</span>}
+                                </div>
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </Card>
+
+              {/* TABLA DETALLE */}
+              <Card>
+                <Eyebrow>Clasificación individual por SKU</Eyebrow>
+                <div className="overflow-x-auto mt-2">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="text-left border-b" style={{ color: COLORS.inkMuted, borderColor: COLORS.border }}>
+                        <th className="py-2 pr-4 font-medium">SKU</th>
+                        <th className="py-2 pr-4 font-medium">Clase</th>
+                        <th className="py-2 pr-4 font-medium">Venta 12m</th>
+                        <th className="py-2 pr-4 font-medium">% portafolio</th>
+                        <th className="py-2 pr-4 font-medium">CV</th>
+                        <th className="py-2 pr-4 font-medium">Estrategia recomendada</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {Object.keys(abcxyz).sort((a, b) => abcxyz[b].total - abcxyz[a].total).map((sku) => {
+                        const info = abcxyz[sku];
+                        const strat = ABC_XYZ_STRATEGIES[info.cell];
+                        return (
+                          <tr key={sku} className="border-b" style={{ borderColor: COLORS.grid }}>
+                            <td className="py-2 pr-4">
+                              <button onClick={() => { setSelectedSku(sku); setView("detalle"); }} className="text-left">
+                                <div className="font-semibold" style={{ color: COLORS.ink }}>{sku}</div>
+                                <div className="text-xs" style={{ color: COLORS.inkMuted }}>{skuData[sku].name}</div>
+                              </button>
+                            </td>
+                            <td className="py-2 pr-4">
+                              <span className="text-sm font-bold font-mono px-2 py-0.5 rounded" style={{ background: strat.color + "22", color: strat.color }}>{info.cell}</span>
+                            </td>
+                            <td className="py-2 pr-4 font-mono">{fmt(info.total)}</td>
+                            <td className="py-2 pr-4 font-mono">{fmtPct(info.pct)}</td>
+                            <td className="py-2 pr-4 font-mono">{info.cv > 10 ? ">10" : info.cv.toFixed(2)}</td>
+                            <td className="py-2 pr-4 text-xs" style={{ color: COLORS.inkMuted }}>{strat.desc}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </Card>
+            </div>
+          )}
+
+          {/* VISTA TOP-DOWN SUCURSAL */}
+          {view === "sucursales" && branchBreakdown && branchTotals && (
+            <div className="space-y-6">
+              {/* KPIs por sucursal */}
+              <div>
+                <Eyebrow>Forecast por sucursal · próximos {horizon} meses</Eyebrow>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mt-2">
+                  {branchTotals.map((b) => (
+                    <Card key={b.branch}>
+                      <div className="text-sm font-semibold" style={{ color: COLORS.ink }}>{b.branch}</div>
+                      <div className="text-2xl font-semibold font-mono mt-1" style={{ color: COLORS.accent }}>{fmt(b.total)}</div>
+                      <div className="text-xs mt-0.5" style={{ color: COLORS.inkMuted }}>{b.skuCount} SKU activos</div>
+                    </Card>
+                  ))}
+                </div>
+              </div>
+
+              {/* Gráfico de distribución */}
+              <Card>
+                <Eyebrow>Distribución del forecast total por sucursal</Eyebrow>
+                <ResponsiveContainer width="100%" height={260}>
+                  <BarChart data={branchTotals} margin={{ top: 10, right: 16, left: 0, bottom: 0 }} layout="vertical">
+                    <CartesianGrid stroke={COLORS.grid} horizontal={false} />
+                    <XAxis type="number" tick={{ fontSize: 11, fill: COLORS.inkMuted }} />
+                    <YAxis type="category" dataKey="branch" tick={{ fontSize: 11, fill: COLORS.inkMuted }} width={90} />
+                    <Tooltip contentStyle={{ fontSize: 12, borderRadius: 6, borderColor: COLORS.border }} formatter={(v) => [fmt(v) + " u.", "Forecast"]} />
+                    <Bar dataKey="total" name="Forecast" fill={COLORS.accent} radius={[0, 3, 3, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </Card>
+
+              {/* Selector + tabla detallada */}
+              <Card>
+                <div className="flex items-center justify-between flex-wrap gap-3 mb-3">
+                  <Eyebrow>Detalle SKU × Sucursal</Eyebrow>
+                  <div className="flex items-center gap-2">
+                    <select value={branchView} onChange={(e) => setBranchView(e.target.value)}
+                      className="border rounded-md px-2 py-1.5 text-sm" style={{ borderColor: COLORS.border, color: COLORS.ink, background: COLORS.panel }}>
+                      <option value="ALL">Todas las sucursales</option>
+                      {branches.map((b) => <option key={b} value={b}>{b}</option>)}
+                    </select>
+                    <button
+                      onClick={() => {
+                        const header = ["SKU", "Nombre", "Sucursal", "% Mezcla", ...futureMonthLabels, "Total"];
+                        const lines = [header.join(",")];
+                        const rows = branchView === "ALL" ? branchBreakdown : branchBreakdown.filter((r) => r.branch === branchView);
+                        for (const r of rows) {
+                          lines.push([r.sku, `"${r.name}"`, `"${r.branch}"`, `${(r.share * 100).toFixed(1)}%`, ...r.monthly, r.total].join(","));
+                        }
+                        const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8;" });
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement("a");
+                        a.href = url; a.download = "forecast_por_sucursal.csv"; a.click();
+                        URL.revokeObjectURL(url);
+                      }}
+                      className="flex items-center gap-2 px-3 py-1.5 rounded-md text-xs font-medium border"
+                      style={{ borderColor: COLORS.border, color: COLORS.ink }}>
+                      <Download size={14} /> Exportar CSV
+                    </button>
+                  </div>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="text-left border-b" style={{ color: COLORS.inkMuted, borderColor: COLORS.border }}>
+                        <th className="py-2 pr-3 font-medium">SKU</th>
+                        <th className="py-2 pr-3 font-medium">Sucursal</th>
+                        <th className="py-2 pr-3 font-medium text-right">% Mezcla</th>
+                        {futureMonthLabels.map((lbl) => (
+                          <th key={lbl} className="py-2 pr-3 font-medium text-right font-mono">{lbl}</th>
+                        ))}
+                        <th className="py-2 pr-3 font-medium text-right">Total</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {(branchView === "ALL" ? branchBreakdown : branchBreakdown.filter((r) => r.branch === branchView)).map((r, i) => (
+                        <tr key={i} className="border-b" style={{ borderColor: COLORS.grid }}>
+                          <td className="py-2 pr-3">
+                            <div className="font-semibold text-xs" style={{ color: COLORS.ink }}>{r.sku}</div>
+                            <div className="text-xs truncate max-w-[120px]" style={{ color: COLORS.inkMuted }}>{r.name}</div>
+                          </td>
+                          <td className="py-2 pr-3 text-xs" style={{ color: COLORS.ink }}>{r.branch}</td>
+                          <td className="py-2 pr-3 font-mono text-right text-xs" style={{ color: COLORS.inkMuted }}>{(r.share * 100).toFixed(1)}%</td>
+                          {r.monthly.map((v, j) => (
+                            <td key={j} className="py-2 pr-3 font-mono text-right">{fmt(v)}</td>
+                          ))}
+                          <td className="py-2 pr-3 font-mono text-right font-semibold" style={{ color: COLORS.accent }}>{fmt(r.total)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <p className="text-xs mt-3" style={{ color: COLORS.inkMuted }}>
+                  El forecast total de cada SKU se reparte entre sucursales según su participación histórica de venta (mezcla top-down).
+                  Para cargar tus sucursales reales, incluye una columna "Sucursal" en el CSV.
+                </p>
+              </Card>
+            </div>
+          )}
+
+          {/* VISTA PROMOCIONES */}
+          {view === "promo" && skuData && analysis && (
+            <div className="space-y-6">
+              <Card>
+                <div className="flex items-end justify-between flex-wrap gap-3">
+                  <div>
+                    <Eyebrow>Gestión de promociones</Eyebrow>
+                    <p className="text-xs mt-1 max-w-2xl" style={{ color: COLORS.inkMuted }}>
+                      Marca los meses históricos que tuvieron promoción para que el modelo no los aprenda como demanda normal (evita inflar el forecast base).
+                      Luego define el uplift esperado para promociones futuras y se suma al forecast.
+                    </p>
+                  </div>
+                  <select value={promoSku || ""} onChange={(e) => setPromoSku(e.target.value)}
+                    className="border rounded-md px-2 py-1.5 text-sm" style={{ borderColor: COLORS.border, color: COLORS.ink, background: COLORS.panel }}>
+                    {Object.keys(skuData).map((s) => <option key={s} value={s}>{s} · {skuData[s].name}</option>)}
+                  </select>
+                </div>
+              </Card>
+
+              {promoSku && (() => {
+                const dates = skuData[promoSku].dates;
+                const series = skuData[promoSku].series;
+                const histPromo = promoHist[promoSku] || new Set();
+                const futureMap = promoFuture[promoSku] || {};
+                const lastDate = dates[dates.length - 1];
+                // mostrar últimos 18 meses para no saturar
+                const startIdx = Math.max(0, series.length - 18);
+                return (
+                  <>
+                    {/* PROMOS HISTÓRICAS */}
+                    <Card>
+                      <Eyebrow>Promociones históricas · marca los meses con promo</Eyebrow>
+                      <p className="text-xs mt-1 mb-3" style={{ color: COLORS.inkMuted }}>
+                        Los meses marcados se normalizan (reemplazados por el nivel base) antes de entrenar el modelo. Mostrando últimos 18 meses.
+                      </p>
+                      <div className="flex flex-wrap gap-2">
+                        {dates.slice(startIdx).map((d, idx) => {
+                          const i = startIdx + idx;
+                          const isPromo = histPromo.has(i);
+                          return (
+                            <button key={i}
+                              onClick={() => {
+                                setPromoHist((prev) => {
+                                  const s = new Set(prev[promoSku] || []);
+                                  if (s.has(i)) s.delete(i); else s.add(i);
+                                  return { ...prev, [promoSku]: s };
+                                });
+                              }}
+                              className="px-2.5 py-1.5 rounded-md border text-xs font-mono"
+                              style={{
+                                background: isPromo ? COLORS.amber : COLORS.panel,
+                                color: isPromo ? "#fff" : COLORS.ink,
+                                borderColor: isPromo ? COLORS.amber : COLORS.border,
+                              }}>
+                              {monthLabel(d)}
+                              <span className="block text-[10px]" style={{ opacity: 0.8 }}>{fmt(series[i])}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                      {histPromo.size > 0 && (
+                        <p className="text-xs mt-3" style={{ color: COLORS.amber }}>
+                          ✓ {histPromo.size} mes(es) marcado(s) como promo. El modelo los está normalizando para no sobreestimar la base.
+                        </p>
+                      )}
+                    </Card>
+
+                    {/* PROMOS FUTURAS */}
+                    <Card>
+                      <Eyebrow>Promociones futuras · uplift esperado sobre el forecast base</Eyebrow>
+                      <p className="text-xs mt-1 mb-3" style={{ color: COLORS.inkMuted }}>
+                        Define el % de incremento esperado por la promo. Se suma al forecast estadístico del mes correspondiente.
+                      </p>
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-sm">
+                          <thead>
+                            <tr className="text-left border-b" style={{ color: COLORS.inkMuted, borderColor: COLORS.border }}>
+                              <th className="py-2 pr-3 font-medium">Mes futuro</th>
+                              <th className="py-2 pr-3 font-medium text-right">Forecast base</th>
+                              <th className="py-2 pr-3 font-medium text-right">Uplift %</th>
+                              <th className="py-2 pr-3 font-medium text-right">Forecast con promo</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {Array.from({ length: horizon }, (_, i) => {
+                              const usedKey = modelOverrides[promoSku] || analysis[promoSku].winnerKey;
+                              const baseFc = finalForecast(effectiveSeries[promoSku], usedKey, 24);
+                              const baseVal = baseFc ? Math.round(baseFc.forecastFull[i]) : 0;
+                              const up = futureMap[i] || 0;
+                              const withPromo = Math.round(baseVal * (1 + up));
+                              const d = addMonths(lastDate, i + 1);
+                              return (
+                                <tr key={i} className="border-b" style={{ borderColor: COLORS.grid }}>
+                                  <td className="py-2 pr-3 font-mono text-xs" style={{ color: COLORS.ink }}>{monthLabel(d)}</td>
+                                  <td className="py-2 pr-3 font-mono text-right">{fmt(baseVal)}</td>
+                                  <td className="py-2 pr-3 text-right">
+                                    <div className="flex items-center justify-end gap-1">
+                                      <input type="number" min="-50" max="500" step="5"
+                                        value={up ? Math.round(up * 100) : ""}
+                                        placeholder="0"
+                                        onChange={(e) => {
+                                          const pct = e.target.value === "" ? 0 : Number(e.target.value) / 100;
+                                          setPromoFuture((prev) => ({ ...prev, [promoSku]: { ...(prev[promoSku] || {}), [i]: pct } }));
+                                        }}
+                                        className="w-16 border rounded px-1 py-0.5 text-xs font-mono text-right"
+                                        style={{ borderColor: up ? COLORS.amber : COLORS.border }} />
+                                      <span className="text-xs" style={{ color: COLORS.inkMuted }}>%</span>
+                                    </div>
+                                  </td>
+                                  <td className="py-2 pr-3 font-mono text-right font-semibold" style={{ color: up ? COLORS.amber : COLORS.ink }}>
+                                    {fmt(withPromo)}{up ? ` (+${fmt(withPromo - baseVal)})` : ""}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                      <p className="text-xs mt-3" style={{ color: COLORS.inkMuted }}>
+                        El forecast con promo se refleja automáticamente en la pestaña Detalle SKU y en el Resumen.
+                      </p>
+                    </Card>
+                  </>
+                );
+              })()}
+            </div>
+          )}
+
+          {/* VISTA FVA & AJUSTE COLABORATIVO */}
+          {view === "fva" && (
+            <div className="space-y-6">
+
+              {/* MARCADOR */}
+              <Card>
+                <Eyebrow>Marcador FVA · Forecast Value Add por colaborador</Eyebrow>
+                <p className="text-xs mt-1 mb-4" style={{ color: COLORS.inkMuted }}>
+                  FVA mide si el ajuste humano mejoró o empeoró el forecast estadístico. Positivo = agrega valor. Negativo = destruye valor.
+                  El histórico simulado se basa en el período de backtest; los ajustes reales que guardes se suman cuando ingresas el resultado real.
+                </p>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="text-left border-b" style={{ color: COLORS.inkMuted, borderColor: COLORS.border }}>
+                        <th className="py-2 pr-4 font-medium">Colaborador</th>
+                        <th className="py-2 pr-4 font-medium text-right"># Ajustes</th>
+                        <th className="py-2 pr-4 font-medium text-right">WMAPE estadístico</th>
+                        <th className="py-2 pr-4 font-medium text-right">WMAPE ajustado</th>
+                        <th className="py-2 pr-4 font-medium text-right">FVA</th>
+                        <th className="py-2 pr-4 font-medium text-right">% Mejoró</th>
+                        <th className="py-2 pr-4 font-medium text-right">Sesgo prom.</th>
+                        <th className="py-2 pr-4 font-medium">Veredicto</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {fvaMetrics.map((m) => {
+                        const v = FVA_VERDICT(m.fva);
+                        const def = COLLAB_DEFS.find((c) => c.name === m.name);
+                        return (
+                          <tr key={m.name} className="border-b" style={{ borderColor: COLORS.grid }}>
+                            <td className="py-3 pr-4">
+                              <div className="flex items-center gap-2">
+                                <div className="w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold text-white flex-shrink-0"
+                                  style={{ background: def?.color || COLORS.graphite }}>
+                                  {m.name.charAt(0)}
+                                </div>
+                                <span className="font-medium" style={{ color: COLORS.ink }}>{m.name}</span>
+                              </div>
+                            </td>
+                            <td className="py-3 pr-4 font-mono text-right">{m.count}</td>
+                            <td className="py-3 pr-4 font-mono text-right">{fmtPct(m.statWmape)}</td>
+                            <td className="py-3 pr-4 font-mono text-right">{fmtPct(m.adjWmape)}</td>
+                            <td className="py-3 pr-4 font-mono text-right font-bold" style={{ color: m.fva > 0 ? COLORS.accent : m.fva < 0 ? COLORS.brick : COLORS.inkMuted }}>
+                              {m.fva != null ? `${m.fva >= 0 ? "+" : ""}${(m.fva * 100).toFixed(1)}pp` : "—"}
+                            </td>
+                            <td className="py-3 pr-4 font-mono text-right">{fmtPct(m.pctImproved)}</td>
+                            <td className="py-3 pr-4 font-mono text-right" style={{ color: m.avgBias > 0 ? COLORS.amber : COLORS.ink }}>
+                              {m.avgBias >= 0 ? "+" : ""}{fmt(m.avgBias, 1)} u.
+                            </td>
+                            <td className="py-3 pr-4">
+                              <span className="text-xs font-semibold px-2 py-0.5 rounded-full"
+                                style={{ background: v.color + "22", color: v.color }}>
+                                {v.label}
+                              </span>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </Card>
+
+              {/* INGRESAR AJUSTE */}
+              <Card>
+                <Eyebrow>Ingresar ajuste al forecast</Eyebrow>
+                <div className="flex flex-wrap items-end gap-3 mt-3 mb-4">
+                  <div>
+                    <label className="text-xs font-medium block mb-1" style={{ color: COLORS.inkMuted }}>SKU</label>
+                    <select value={fvaSku || ""} onChange={(e) => { setFvaSku(e.target.value); setAdjInputs({}); }}
+                      className="border rounded-md px-2 py-1.5 text-sm" style={{ borderColor: COLORS.border, color: COLORS.ink, background: COLORS.panel }}>
+                      {skuData && Object.keys(skuData).map((s) => <option key={s} value={s}>{s}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs font-medium block mb-1" style={{ color: COLORS.inkMuted }}>Colaborador</label>
+                    <select value={selectedCollab} onChange={(e) => setSelectedCollab(e.target.value)}
+                      className="border rounded-md px-2 py-1.5 text-sm" style={{ borderColor: COLORS.border, color: COLORS.ink, background: COLORS.panel }}>
+                      {collaboratorList.map((c) => <option key={c} value={c}>{c}</option>)}
+                    </select>
+                  </div>
+                  <div className="flex gap-2 items-end">
+                    <div>
+                      <label className="text-xs font-medium block mb-1" style={{ color: COLORS.inkMuted }}>Agregar colaborador</label>
+                      <input value={newCollabInput} onChange={(e) => setNewCollabInput(e.target.value)}
+                        placeholder="Nombre · Área"
+                        className="border rounded-md px-2 py-1.5 text-sm w-40"
+                        style={{ borderColor: COLORS.border, color: COLORS.ink }} />
+                    </div>
+                    <button onClick={() => {
+                      if (newCollabInput.trim() && !collaboratorList.includes(newCollabInput.trim())) {
+                        setCollaboratorList((p) => [...p, newCollabInput.trim()]);
+                        setSelectedCollab(newCollabInput.trim());
+                        setNewCollabInput("");
+                      }
+                    }}
+                      className="px-3 py-1.5 rounded-md text-sm border font-medium"
+                      style={{ borderColor: COLORS.border, color: COLORS.ink }}>
+                      + Agregar
+                    </button>
+                  </div>
+                </div>
+
+                {fvaSku && skuData && analysis && (() => {
+                  const usedKey = modelOverrides[fvaSku] || analysis[fvaSku].winnerKey;
+                  const fc = finalForecast(effectiveSeries[fvaSku], usedKey, 24);
+                  const lastDate = skuData[fvaSku].dates[skuData[fvaSku].dates.length - 1];
+                  const rows = Array.from({ length: horizon }, (_, i) => {
+                    const d = addMonths(lastDate, i + 1);
+                    const mk = `${d.y}-${String(d.m + 1).padStart(2, "0")}`;
+                    const stat = fc ? Math.round(fc.forecastFull[i] * 10) / 10 : null;
+                    return { d, mk, lbl: monthLabel(d), stat };
+                  });
+                  return (
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-sm">
+                        <thead>
+                          <tr className="text-left border-b" style={{ color: COLORS.inkMuted, borderColor: COLORS.border }}>
+                            <th className="py-2 pr-3 font-medium">Mes</th>
+                            <th className="py-2 pr-3 font-medium text-right">Forecast estadístico</th>
+                            <th className="py-2 pr-3 font-medium text-right">Mi ajuste</th>
+                            <th className="py-2 pr-3 font-medium">Comentario / motivo</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {rows.map(({ mk, lbl, stat }) => {
+                            const inp = adjInputs[mk] || {};
+                            const diff = inp.value != null && stat != null ? inp.value - stat : null;
+                            return (
+                              <tr key={mk} className="border-b" style={{ borderColor: COLORS.grid }}>
+                                <td className="py-2 pr-3 font-mono text-xs" style={{ color: COLORS.ink }}>{lbl}</td>
+                                <td className="py-2 pr-3 font-mono text-right">{fmt(stat, 0)}</td>
+                                <td className="py-2 pr-3">
+                                  <div className="flex items-center gap-2 justify-end">
+                                    {diff != null && (
+                                      <span className="text-xs font-mono" style={{ color: diff > 0 ? COLORS.amber : diff < 0 ? COLORS.accent : COLORS.inkMuted }}>
+                                        {diff >= 0 ? "+" : ""}{fmt(diff, 0)}
+                                      </span>
+                                    )}
+                                    <input type="number" min="0" placeholder={fmt(stat, 0)}
+                                      value={inp.value ?? ""}
+                                      onChange={(e) => setAdjInputs((p) => ({ ...p, [mk]: { ...p[mk], value: e.target.value === "" ? null : Number(e.target.value) } }))}
+                                      className="w-24 border rounded px-2 py-0.5 text-xs font-mono text-right"
+                                      style={{ borderColor: inp.value != null ? COLORS.accent : COLORS.border }} />
+                                  </div>
+                                </td>
+                                <td className="py-2 pr-3">
+                                  <input type="text" placeholder="ej: promo confirmada, nuevo cliente…"
+                                    value={inp.comment ?? ""}
+                                    onChange={(e) => setAdjInputs((p) => ({ ...p, [mk]: { ...p[mk], comment: e.target.value } }))}
+                                    className="w-full border rounded px-2 py-0.5 text-xs"
+                                    style={{ borderColor: COLORS.border }} />
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                      <button
+                        onClick={() => {
+                          const usedKey2 = modelOverrides[fvaSku] || analysis[fvaSku].winnerKey;
+                          const fc2 = finalForecast(effectiveSeries[fvaSku], usedKey2, 24);
+                          const lastDate2 = skuData[fvaSku].dates[skuData[fvaSku].dates.length - 1];
+                          const newRecs = [];
+                          for (let i = 0; i < horizon; i++) {
+                            const d = addMonths(lastDate2, i + 1);
+                            const mk = `${d.y}-${String(d.m + 1).padStart(2, "0")}`;
+                            const inp = adjInputs[mk] || {};
+                            if (inp.value == null) continue;
+                            const stat = fc2 ? Math.round(fc2.forecastFull[i] * 10) / 10 : 0;
+                            newRecs.push({ id: `${fvaSku}_${mk}_${Date.now()}`, sku: fvaSku, monthKey: mk, monthLabel: monthLabel(d), statistical: stat, adjusted: inp.value, collaborator: selectedCollab, comment: inp.comment || "", actual: null });
+                          }
+                          if (newRecs.length > 0) { setSavedAdjustments((p) => [...p, ...newRecs]); setAdjInputs({}); }
+                        }}
+                        className="mt-3 px-4 py-2 rounded-md text-sm font-medium"
+                        style={{ background: COLORS.accent, color: "#fff" }}>
+                        Guardar ajustes
+                      </button>
+                    </div>
+                  );
+                })()}
+              </Card>
+
+              {/* AJUSTES GUARDADOS */}
+              {savedAdjustments.length > 0 && (
+                <Card>
+                  <Eyebrow>Ajustes guardados · pendientes de resultado real</Eyebrow>
+                  <div className="overflow-x-auto mt-2">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="text-left border-b" style={{ color: COLORS.inkMuted, borderColor: COLORS.border }}>
+                          <th className="py-2 pr-3 font-medium">SKU</th>
+                          <th className="py-2 pr-3 font-medium">Mes</th>
+                          <th className="py-2 pr-3 font-medium text-right">Estadístico</th>
+                          <th className="py-2 pr-3 font-medium text-right">Ajustado</th>
+                          <th className="py-2 pr-3 font-medium">Colaborador</th>
+                          <th className="py-2 pr-3 font-medium">Comentario</th>
+                          <th className="py-2 pr-3 font-medium text-right">Real (ingresar)</th>
+                          <th className="py-2 pr-3 font-medium text-right">FVA</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {savedAdjustments.map((a) => {
+                          const fva = a.actual != null
+                            ? (Math.abs(a.actual - a.statistical) - Math.abs(a.actual - a.adjusted)) / Math.max(1, a.actual)
+                            : null;
+                          const v = FVA_VERDICT(fva);
+                          const def = COLLAB_DEFS.find((c) => c.name === a.collaborator);
+                          return (
+                            <tr key={a.id} className="border-b" style={{ borderColor: COLORS.grid }}>
+                              <td className="py-2 pr-3 font-semibold text-xs" style={{ color: COLORS.ink }}>{a.sku}</td>
+                              <td className="py-2 pr-3 font-mono text-xs" style={{ color: COLORS.inkMuted }}>{a.monthLabel}</td>
+                              <td className="py-2 pr-3 font-mono text-right">{fmt(a.statistical, 0)}</td>
+                              <td className="py-2 pr-3 font-mono text-right font-semibold" style={{ color: def?.color || COLORS.ink }}>{fmt(a.adjusted, 0)}</td>
+                              <td className="py-2 pr-3 text-xs">
+                                <div className="flex items-center gap-1.5">
+                                  <div className="w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold text-white flex-shrink-0"
+                                    style={{ background: def?.color || COLORS.graphite }}>{a.collaborator.charAt(0)}</div>
+                                  <span style={{ color: COLORS.ink }}>{a.collaborator}</span>
+                                </div>
+                              </td>
+                              <td className="py-2 pr-3 text-xs" style={{ color: COLORS.inkMuted }}>{a.comment || "—"}</td>
+                              <td className="py-2 pr-3">
+                                <input type="number" min="0" placeholder="—"
+                                  value={a.actual ?? ""}
+                                  onChange={(e) => setSavedAdjustments((p) => p.map((x) => x.id === a.id ? { ...x, actual: e.target.value === "" ? null : Number(e.target.value) } : x))}
+                                  className="w-20 border rounded px-1 py-0.5 text-xs font-mono text-right"
+                                  style={{ borderColor: COLORS.border }} />
+                              </td>
+                              <td className="py-2 pr-3 text-right">
+                                {fva != null
+                                  ? <span className="text-xs font-bold" style={{ color: v.color }}>{fva >= 0 ? "+" : ""}{(fva * 100).toFixed(1)}pp</span>
+                                  : <span className="text-xs" style={{ color: COLORS.inkMuted }}>pendiente</span>}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </Card>
+              )}
+
+              {/* HISTORIAL FVA DETALLADO (backtest simulado) */}
+              <Card>
+                <Eyebrow>Historial de ajustes simulados (período de backtest)</Eyebrow>
+                <p className="text-xs mt-1 mb-3" style={{ color: COLORS.inkMuted }}>
+                  Estos datos se generan automáticamente usando el período de holdout para que puedas ver cómo habría funcionado el sistema.
+                  Los ajustes reales guardados arriba se sumarán aquí una vez que ingreses el resultado.
+                </p>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="text-left border-b" style={{ color: COLORS.inkMuted, borderColor: COLORS.border }}>
+                        <th className="py-2 pr-3 font-medium">SKU</th>
+                        <th className="py-2 pr-3 font-medium">Mes</th>
+                        <th className="py-2 pr-3 font-medium">Colaborador</th>
+                        <th className="py-2 pr-3 font-medium text-right">Estadístico</th>
+                        <th className="py-2 pr-3 font-medium text-right">Ajustado</th>
+                        <th className="py-2 pr-3 font-medium text-right">Real</th>
+                        <th className="py-2 pr-3 font-medium text-right">Error stat.</th>
+                        <th className="py-2 pr-3 font-medium text-right">Error ajuste</th>
+                        <th className="py-2 pr-3 font-medium text-right">FVA</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {historicalFVA.slice(0, 40).map((r, i) => {
+                        const errStat = Math.abs(r.actual - r.statistical);
+                        const errAdj  = Math.abs(r.actual - r.adjusted);
+                        const fva = r.actual > 0 ? (errStat - errAdj) / r.actual : null;
+                        const def = COLLAB_DEFS.find((c) => c.name === r.collaborator);
+                        return (
+                          <tr key={i} className="border-b" style={{ borderColor: COLORS.grid }}>
+                            <td className="py-1.5 pr-3 font-semibold" style={{ color: COLORS.ink }}>{r.sku}</td>
+                            <td className="py-1.5 pr-3 font-mono" style={{ color: COLORS.inkMuted }}>{r.monthLbl}</td>
+                            <td className="py-1.5 pr-3">
+                              <div className="flex items-center gap-1">
+                                <div className="w-4 h-4 rounded-full flex items-center justify-center text-[9px] font-bold text-white" style={{ background: def?.color || COLORS.graphite }}>{r.collaborator.charAt(0)}</div>
+                                <span style={{ color: COLORS.ink }}>{r.collaborator}</span>
+                              </div>
+                            </td>
+                            <td className="py-1.5 pr-3 font-mono text-right">{fmt(r.statistical, 0)}</td>
+                            <td className="py-1.5 pr-3 font-mono text-right">{fmt(r.adjusted, 0)}</td>
+                            <td className="py-1.5 pr-3 font-mono text-right">{fmt(r.actual, 0)}</td>
+                            <td className="py-1.5 pr-3 font-mono text-right" style={{ color: COLORS.inkMuted }}>{fmt(errStat, 0)}</td>
+                            <td className="py-1.5 pr-3 font-mono text-right" style={{ color: errAdj < errStat ? COLORS.accent : COLORS.brick }}>{fmt(errAdj, 0)}</td>
+                            <td className="py-1.5 pr-3 font-mono text-right font-bold" style={{ color: fva != null && fva > 0 ? COLORS.accent : COLORS.brick }}>
+                              {fva != null ? `${fva >= 0 ? "+" : ""}${(fva * 100).toFixed(1)}pp` : "—"}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                  {historicalFVA.length > 40 && (
+                    <p className="text-xs mt-2" style={{ color: COLORS.inkMuted }}>Mostrando 40 de {historicalFVA.length} registros.</p>
+                  )}
+                </div>
+              </Card>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
